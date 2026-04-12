@@ -7613,10 +7613,13 @@ class GatewayRunner:
                         full_text = "\n".join(progress_lines)
                         # When merge_segments is active, inject into streaming
                         # output instead of sending a separate message.
+                        # Only inject the NEW line — the stream consumer's own
+                        # _accumulated buffer already holds all previous content,
+                        # so injecting full_text would duplicate everything.
                         _sc_local = stream_consumer_holder[0]
                         if (_sc_local
                                 and getattr(_sc_local.cfg, 'merge_segments', True)):
-                            _sc_local.inject(full_text)
+                            _sc_local.inject(msg)
                         else:
                             result = await adapter.edit_message(
                                 chat_id=source.chat_id,
@@ -7644,11 +7647,12 @@ class GatewayRunner:
                     else:
                         if can_edit:
                             # First tool: inject into streaming output or send as new message
+                            # Only inject the NEW line — stream consumer accumulates.
                             full_text = "\n".join(progress_lines)
                             _sc_local = stream_consumer_holder[0]
                             if (_sc_local
                                     and getattr(_sc_local.cfg, 'merge_segments', True)):
-                                _sc_local.inject(full_text)
+                                _sc_local.inject(msg)
                                 result = type('obj', (object,), {'success': True, 'message_id': None})()
                             else:
                                 result = await adapter.send(chat_id=source.chat_id, content=full_text, metadata=_progress_metadata)
