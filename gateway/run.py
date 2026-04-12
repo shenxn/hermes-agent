@@ -7611,11 +7611,18 @@ class GatewayRunner:
                     if can_edit and progress_msg_id is not None:
                         # Try to edit the existing progress message
                         full_text = "\n".join(progress_lines)
-                        result = await adapter.edit_message(
-                            chat_id=source.chat_id,
-                            message_id=progress_msg_id,
-                            content=full_text,
-                        )
+                        # When merge_segments is active, inject into streaming
+                        # output instead of sending a separate message.
+                        _sc_local = stream_consumer_holder[0]
+                        if (_sc_local
+                                and getattr(_sc_local.cfg, 'merge_segments', True)):
+                            _sc_local.inject(full_text)
+                        else:
+                            result = await adapter.edit_message(
+                                chat_id=source.chat_id,
+                                message_id=progress_msg_id,
+                                content=full_text,
+                            )
                         if not result.success:
                             _err = (getattr(result, "error", "") or "").lower()
                             if "flood" in _err or "retry after" in _err:
@@ -7626,16 +7633,34 @@ class GatewayRunner:
                                     "[%s] Progress edits disabled due to flood control",
                                     adapter.name,
                                 )
-                            can_edit = False
-                            await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_metadata)
+                                can_edit = False
+                            # When merge_segments, inject instead of separate message
+                            _sc_local = stream_consumer_holder[0]
+                            if (_sc_local
+                                    and getattr(_sc_local.cfg, 'merge_segments', True)):
+                                _sc_local.inject(msg)
+                            else:
+                                await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_metadata)
                     else:
                         if can_edit:
-                            # First tool: send all accumulated text as new message
+                            # First tool: inject into streaming output or send as new message
                             full_text = "\n".join(progress_lines)
-                            result = await adapter.send(chat_id=source.chat_id, content=full_text, metadata=_progress_metadata)
+                            _sc_local = stream_consumer_holder[0]
+                            if (_sc_local
+                                    and getattr(_sc_local.cfg, 'merge_segments', True)):
+                                _sc_local.inject(full_text)
+                                result = type('obj', (object,), {'success': True, 'message_id': None})()
+                            else:
+                                result = await adapter.send(chat_id=source.chat_id, content=full_text, metadata=_progress_metadata)
                         else:
-                            # Editing unsupported: send just this line
-                            result = await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_metadata)
+                            # Editing unsupported: inject or send just this line
+                            _sc_local = stream_consumer_holder[0]
+                            if (_sc_local
+                                    and getattr(_sc_local.cfg, 'merge_segments', True)):
+                                _sc_local.inject(msg)
+                                result = type('obj', (object,), {'success': True, 'message_id': None})()
+                            else:
+                                result = await adapter.send(chat_id=source.chat_id, content=msg, metadata=_progress_metadata)
                         if result.success and result.message_id:
                             progress_msg_id = result.message_id
 
@@ -7711,12 +7736,29 @@ class GatewayRunner:
             except Exception as _e:
                 logger.debug("agent:step hook error: %s", _e)
 
-        # Bridge sync status_callback → async adapter.send for context pressure
+        # Bridge sync status_callback → stream consumer inject or adapter.send
         _status_adapter = self.adapters.get(source.platform)
         _status_chat_id = source.chat_id
         _status_thread_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
 
         def _status_callback_sync(event_type: str, message: str) -> None:
+            # When streaming + merge_segments is active, inject tool progress
+            # into the streaming output (CardKit card or edited message) so
+            # everything appears in a single unified message.
+            _sc_merge = getattr(_scfg, 'merge_segments', True) if _scfg else False
+            if (_stream_consumer is not None
+                    and _sc_merge):
+                try:
+                    logger.warning("[inject] callback: event=%s msg=%s sc=%s merge=%s",
+                                   event_type, message[:80], _stream_consumer is not None, _sc_merge)
+                    _stream_consumer.inject(message)
+                    return
+                except Exception as _ex:
+                    logger.warning("[inject] FAILED: %s", _ex)
+                    pass  # fallback to legacy send path
+            # Legacy: send each tool progress as a separate message
+            logger.warning("[status_callback] LEGACY path (no inject): event=%s consumer=%s merge=%s",
+                           event_type, _stream_consumer is not None, _sc_merge)
             if not _status_adapter:
                 return
             try:
@@ -7810,10 +7852,16 @@ class GatewayRunner:
             _want_stream_deltas = _streaming_enabled
             _want_interim_messages = interim_assistant_messages_enabled
             _want_interim_consumer = _want_interim_messages
+            logger.info("[STREAM-DEBUG] enabled=%s transport=%s merge=%s mode=%s plat=%s → want_stream=%s",
+                        _scfg.enabled, getattr(_scfg, 'transport', '?'),
+                        getattr(_scfg, 'merge_segments', '?'),
+                        getattr(_scfg, 'streaming_mode', '?'),
+                        _plat_streaming, _want_stream_deltas)
             if _want_stream_deltas or _want_interim_consumer:
                 try:
                     from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
                     _adapter = self.adapters.get(source.platform)
+                    logger.info("[STREAM-DEBUG] → entering setup, adapter=%s", _adapter is not None)
                     if _adapter:
                         # Platforms that don't support editing sent messages
                         # (e.g. WeChat) must not show a cursor in intermediate
@@ -7827,6 +7875,7 @@ class GatewayRunner:
                             edit_interval=_scfg.edit_interval,
                             buffer_threshold=_scfg.buffer_threshold,
                             cursor=_effective_cursor,
+                            merge_segments=getattr(_scfg, 'merge_segments', True),
                         )
                         _stream_consumer = GatewayStreamConsumer(
                             adapter=_adapter,
@@ -7837,8 +7886,10 @@ class GatewayRunner:
                         if _want_stream_deltas:
                             _stream_delta_cb = _stream_consumer.on_delta
                         stream_consumer_holder[0] = _stream_consumer
+                        logger.info("[STREAM-DEBUG] → stream consumer CREATED OK, merge=%s",
+                                    getattr(_scfg, 'merge_segments', True))
                 except Exception as _sc_err:
-                    logger.debug("Could not set up stream consumer: %s", _sc_err)
+                    logger.error("[STREAM-DEBUG] → stream consumer FAILED: %s", _sc_err)
 
             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
                 if _stream_consumer is not None:

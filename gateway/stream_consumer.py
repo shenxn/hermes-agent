@@ -36,6 +36,9 @@ _NEW_SEGMENT = object()
 # API/tool iterations (for example: "I'll inspect the repo first.").
 _COMMENTARY = object()
 
+# Queue marker for injected tool-progress text (merged into streaming output)
+_INJECT = object()
+
 
 @dataclass
 class StreamConsumerConfig:
@@ -43,6 +46,7 @@ class StreamConsumerConfig:
     edit_interval: float = 1.0
     buffer_threshold: int = 40
     cursor: str = " ▉"
+    merge_segments: bool = True   # When True, tool progress merges into the same streaming message
 
 
 class GatewayStreamConsumer:
@@ -109,6 +113,17 @@ class GatewayStreamConsumer:
         if text:
             self._queue.put((_COMMENTARY, text))
 
+    def inject(self, text: str) -> None:
+        """Thread-safe callback — inject tool-progress text into the stream.
+
+        When merge_segments is active, this feeds tool-status lines into the
+        same queue that carries agent text deltas so they appear in a single
+        streaming message (CardKit card or edited message).
+        """
+        if text:
+            logger.debug("[inject] → %s", text[:120])
+            self._queue.put((_INJECT, text))
+
     def _reset_segment_state(self, *, preserve_no_edit: bool = False) -> None:
         if preserve_no_edit and self._message_id == "__no_edit__":
             return
@@ -158,6 +173,13 @@ class GatewayStreamConsumer:
                         if isinstance(item, tuple) and len(item) == 2 and item[0] is _COMMENTARY:
                             commentary_text = item[1]
                             break
+                        # Injected tool-progress: append into accumulated stream text
+                        if isinstance(item, tuple) and len(item) == 2 and item[0] is _INJECT:
+                            if self._accumulated and not self._accumulated.rstrip().endswith("\n"):
+                                self._accumulated += "\n\n"
+                            self._accumulated += item[1] + "\n"
+                            logger.debug("[inject] ⬇ %s", item[1][:80])
+                            continue
                         self._accumulated += item
                     except queue.Empty:
                         break
@@ -165,9 +187,14 @@ class GatewayStreamConsumer:
                 # Decide whether to flush an edit
                 now = time.monotonic()
                 elapsed = now - self._last_edit_time
+                # When merge_segments is active (tool progress injected into the
+                # same streaming output), suppress tool-boundary segment breaks:
+                # they would cause a redundant flush of already-sent content and
+                # kill the CardKit streaming card prematurely.
+                _merge = getattr(self.cfg, 'merge_segments', False)
                 should_edit = (
                     got_done
-                    or got_segment_break
+                    or (got_segment_break and not _merge)  # skip boundary flush when merged
                     or commentary_text is not None
                     or (elapsed >= self._current_edit_interval
                         and self._accumulated)
@@ -230,7 +257,6 @@ class GatewayStreamConsumer:
                         self._last_sent_text = ""
 
                     display_text = self._accumulated
-                    display_text = self._accumulated
                     if not got_done and not got_segment_break and commentary_text is None and not self._uses_streaming_card:
                         display_text += self.cfg.cursor
 
@@ -276,7 +302,15 @@ class GatewayStreamConsumer:
                 # (When editing fails mid-stream due to flood control the id is
                 # a real string like "msg_1", not "__no_edit__", so that case
                 # still resets and creates a fresh segment as intended.)
-                if got_segment_break:
+                #
+                # When merge_segments is True, tool progress is injected into
+                # the SAME streaming message (CardKit card or edited message).
+                # Do NOT reset state — keep accumulating on the existing message
+                # so injected tool-status lines and subsequent model text all
+                # In merge_segments mode, tool boundaries are swallowed above
+                # (should_edit skips got_segment_break).  For non-merge mode,
+                # reset state so the next model output starts a fresh message.
+                if got_segment_break and not _merge:
                     self._reset_segment_state(preserve_no_edit=True)
                     await self._stop_streaming_card_if_active()
                     self._message_id = None
@@ -517,6 +551,8 @@ class GatewayStreamConsumer:
             return True  # nothing to send is "success"
         try:
             if self._message_id is not None:
+                logger.info("[stream-TRACE] EDIT path msg=%s len=%d fallback=%s edit_sup=%s",
+                            self._message_id, len(text), self._fallback_final_send, self._edit_supported)
                 if self._edit_supported:
                     # Skip if text is identical to what we last sent
                     if text == self._last_sent_text:
@@ -560,10 +596,8 @@ class GatewayStreamConsumer:
                         # Non-flood error OR flood strikes exhausted: enter
                         # fallback mode — send only the missing tail once the
                         # final response is available.
-                        logger.debug(
-                            "Edit failed (strikes=%d), entering fallback mode",
-                            self._flood_strikes,
-                        )
+                        logger.warning("[stream-TRACE] EDIT-FAILED (strikes=%d) entering fallback",
+                                       self._flood_strikes)
                         self._fallback_prefix = self._visible_prefix()
                         self._fallback_final_send = True
                         self._edit_supported = False
@@ -578,16 +612,9 @@ class GatewayStreamConsumer:
                     return False
             else:
                 # First message — send new
-                result = await self.adapter.send(
-                    chat_id=self.chat_id,
-                    content=text,
-                    metadata=self.metadata,
-                )
-                if result.success:
-                    if result.message_id:
-                        self._message_id = result.message_id
-                    else:
-                        self._edit_supported = False
+                logger.info("[stream-TRACE] FIRST-SEND path uses_cardkit=%s len=%d merge=%s mid=%s",
+                             self._uses_streaming_card, len(text),
+                             getattr(self.cfg, 'merge_segments', False), self._message_id)
                 if self._uses_streaming_card:
                     result = await self.adapter.send_streaming_card(
                         chat_id=self.chat_id,

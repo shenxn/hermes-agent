@@ -344,6 +344,7 @@ class _FeishuStreamingCard:
     element_id: str
     message_id: str
     sequence: int = 1  # Strictly increasing across all card operations
+    last_sent_content: str = ""  # Track what was last sent for delta optimization
 
 
 # ---------------------------------------------------------------------------
@@ -1568,17 +1569,31 @@ class FeishuAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Push a streaming text update to a card element.
 
-        *content* should be the **full accumulated text** — the Feishu platform
-        diffs it against the previous value and renders the delta with a
-        typewriter effect.
+        *content* should be the **full accumulated text** — this method
+        computes the delta against ``sc.last_sent_content`` so that Feishu's
+        typewriter effect only animates **new characters**, avoiding a
+        full replay of all historical text on every tool-call boundary.
         """
         try:
+            # Delta optimisation: only send the new suffix.
+            prev = sc.last_sent_content
+            if content.startswith(prev) and len(content) > len(prev):
+                delta = content[len(prev):]
+                # Reconstruct what Feishu should display after this update
+                send_content = content  # CardKit needs full state for rendering
+                logger.debug("[Feishu] CardKit delta: +%d chars (total %d)",
+                             len(delta), len(content))
+            else:
+                # Full replacement (first send or non-contiguous change)
+                delta = None
+                send_content = content
+
             sc.sequence += 1
             body = (
                 ContentCardElementRequestBody.builder()
                 .uuid(str(uuid.uuid4()))
                 .sequence(sc.sequence)
-                .content(content)
+                .content(send_content)
                 .build()
             )
             req = (
@@ -1592,6 +1607,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 self._client.cardkit.v1.card_element.content, req,
             )
             if resp and resp.code == 0:
+                sc.last_sent_content = content
                 return SendResult(success=True, message_id=sc.message_id)
             err_msg = getattr(resp, "msg", "unknown") if resp else "no response"
             logger.warning("[Feishu] Streaming card content update failed: code=%s msg=%s",

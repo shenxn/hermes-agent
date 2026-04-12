@@ -194,6 +194,8 @@ class StreamingConfig:
     edit_interval: float = 1.0    # Seconds between message edits (Telegram rate-limits at ~1/s)
     buffer_threshold: int = 40    # Chars before forcing an edit
     cursor: str = " ▉"           # Cursor shown during streaming
+    merge_segments: bool = True   # Merge tool progress into the same streaming message
+    streaming_mode: str = ""      # "cardkit" for CardKit streaming card transport
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -202,6 +204,8 @@ class StreamingConfig:
             "edit_interval": self.edit_interval,
             "buffer_threshold": self.buffer_threshold,
             "cursor": self.cursor,
+            "merge_segments": self.merge_segments,
+            "streaming_mode": self.streaming_mode,
         }
 
     @classmethod
@@ -214,6 +218,8 @@ class StreamingConfig:
             edit_interval=float(data.get("edit_interval", 1.0)),
             buffer_threshold=int(data.get("buffer_threshold", 40)),
             cursor=data.get("cursor", " ▉"),
+            merge_segments=data.get("merge_segments", True),
+            streaming_mode=data.get("streaming_mode", ""),
         )
 
 
