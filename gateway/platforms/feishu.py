@@ -1681,10 +1681,11 @@ class FeishuAdapter(BasePlatformAdapter):
                     },
                     {
                         "tag": "markdown",
-                        "content": "",
-                        "custom_icon": {
+                        "content": " ",
+                        "icon": {
                             "tag": "custom_icon",
                             "img_key": _STREAMING_LOADING_ICON_KEY,
+                            "size": "16px 16px",
                         },
                         "element_id": _STREAMING_LOADING_ELEMENT_ID,
                     },
