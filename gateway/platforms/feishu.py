@@ -336,6 +336,7 @@ class FeishuGroupRule:
     """Per-group policy rule for controlling which users may interact with the bot."""
 
     policy: str  # "open" | "allowlist" | "blacklist" | "admin_only" | "disabled"
+    require_mention: bool = False
     allowlist: set[str] = field(default_factory=set)
     blacklist: set[str] = field(default_factory=set)
 
@@ -1144,6 +1145,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     continue
                 group_rules[str(chat_id)] = FeishuGroupRule(
                     policy=str(rule_cfg.get("policy", "open")).strip().lower(),
+                    require_mention=bool(rule_cfg.get("require_mention", False)),
                     allowlist=set(str(u).strip() for u in rule_cfg.get("allowlist", []) if str(u).strip()),
                     blacklist=set(str(u).strip() for u in rule_cfg.get("blacklist", []) if str(u).strip()),
                 )
@@ -3442,9 +3444,27 @@ class FeishuAdapter(BasePlatformAdapter):
         return bool(sender_ids and (sender_ids & self._allowed_group_users))
 
     def _should_accept_group_message(self, message: Any, sender_id: Any, chat_id: str = "") -> bool:
-        """Require an explicit @mention before group messages enter the agent."""
+        """Check whether a group message should be processed.
+
+        Two independent gates:
+        1. _allow_group_message — policy/allowlist (who may send)
+        2. @mention check — whether the message targets the bot
+           (skipped when the group rule sets require_mention=False)
+        """
         if not self._allow_group_message(sender_id, chat_id):
             return False
+
+        # Check if this specific group has require_mention=False
+        rule = self._group_rules.get(chat_id) if chat_id else None
+        if rule is not None and not rule.require_mention:
+            return True
+        # Also skip mention check when default policy is "open" and no per-group rule overrides it
+        # This preserves backwards compatibility: FEISHU_GROUP_POLICY=open means fully open.
+        if not rule:
+            default_policy = self._default_group_policy or self._group_policy
+            if default_policy == "open":
+                return True
+
         # @_all is Feishu's @everyone placeholder — always route to the bot.
         raw_content = getattr(message, "content", "") or ""
         if "@_all" in raw_content:
