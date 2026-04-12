@@ -1561,18 +1561,33 @@ class FeishuAdapter(BasePlatformAdapter):
                 return result
 
             message_id = result.message_id
-            # 3. Look up existing Typing reaction (added by _add_ack_reaction on message receipt)
+            # 3. Add "Typing" reaction to original message (best-effort)
+            #    Follows OpenClaw pattern: create → capture reaction_id → delete on complete
             typing_reaction_id: Optional[str] = None
             if reply_to:
                 try:
-                    reactions = await self._get_message_reactions(reply_to)
-                    for r in (reactions or []):
-                        emoji_type = str(getattr(getattr(r, "reaction_type", None), "emoji_type", "") or "")
-                        if emoji_type == _TYPING_EMOJI_TYPE:
-                            typing_reaction_id = getattr(r, "reaction_id", None)
-                            break
-                except Exception:
-                    pass
+                    react_body = (
+                        CreateMessageReactionRequestBody.builder()
+                        .reaction_type(
+                            Emoji.builder().emoji_type(_TYPING_EMOJI_TYPE).build()
+                        )
+                        .build()
+                    )
+                    react_req = (
+                        CreateMessageReactionRequest.builder()
+                        .message_id(reply_to)
+                        .request_body(react_body)
+                        .build()
+                    )
+                    react_resp = await asyncio.to_thread(
+                        self._client.im.v1.message_reaction.create, react_req,
+                    )
+                    if react_resp and react_resp.code == 0:
+                        typing_reaction_id = getattr(react_resp.data, "reaction_id", None)
+                        logger.debug("[Feishu] Added Typing reaction to %s → %s",
+                                     reply_to, typing_reaction_id)
+                except Exception as react_exc:
+                    logger.debug("[Feishu] Failed to add Typing reaction: %s", react_exc)
 
             # 4. Track the streaming card state
             sc = _FeishuStreamingCard(
@@ -2416,19 +2431,14 @@ class FeishuAdapter(BasePlatformAdapter):
         return lock
 
     async def _handle_message_with_guards(self, event: MessageEvent) -> None:
-        """Dispatch a single event through the agent pipeline with per-chat serialization
-        and a Typing emoji reaction before processing starts.
+        """Dispatch a single event through the agent pipeline with per-chat serialization.
 
         - Per-chat lock: ensures messages in the same chat are processed one at a time
           (matches openclaw's createChatQueue serial queue behaviour).
-        - Typing indicator: adds a Typing reaction to show bot is working.
         """
         chat_id = getattr(event.source, "chat_id", "") or "" if event.source else ""
         chat_lock = self._get_chat_lock(chat_id)
         async with chat_lock:
-            message_id = event.message_id
-            if message_id:
-                await self._add_ack_reaction(message_id)
             await self.handle_message(event)
 
     async def _add_ack_reaction(self, message_id: str) -> Optional[str]:
