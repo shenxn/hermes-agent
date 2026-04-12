@@ -82,6 +82,12 @@ try:
         UpdateCardRequest,
         UpdateCardRequestBody,
     )
+    from lark_oapi.api.im.v1 import (
+        CreateMessageReactionRequest,
+        CreateMessageReactionRequestBody,
+        DeleteMessageReactionRequest,
+    )
+    from lark_oapi.api.im.v1.model.emoji import Emoji
     from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTriggerResponse
     from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
     from lark_oapi.ws import Client as FeishuWSClient
@@ -210,6 +216,7 @@ _ONBOARD_REQUEST_TIMEOUT_S = 10
 _STREAMING_CARD_ELEMENT_ID = "streaming_md_1"
 _STREAMING_LOADING_ELEMENT_ID = "streaming_loading"
 _STREAMING_LOADING_ICON_KEY = "img_v3_02vb_496bec09-4b43-4773-ad6b-0cdd103cd2bg"
+_TYPING_EMOJI_TYPE = "Typing"  # Feishu built-in keyboard/typing animation emoji
 _STREAMING_CARD_PRINT_FREQUENCY_MS = 50
 _STREAMING_CARD_PRINT_STEP = 2
 _STREAMING_CARD_PRINT_STRATEGY = "fast"
@@ -350,6 +357,8 @@ class _FeishuStreamingCard:
     sequence: int = 1  # Strictly increasing across all card operations
     last_sent_content: str = ""  # Track what was last sent for delta optimization
     created_at: float = 0.0  # When the card was created (for elapsed time)
+    typing_reaction_id: Optional[str] = None  # Typing emoji reaction ID for cleanup
+    reply_to_message_id: Optional[str] = None  # Original message we're replying to
 
 
 # ---------------------------------------------------------------------------
@@ -1552,13 +1561,42 @@ class FeishuAdapter(BasePlatformAdapter):
                 return result
 
             message_id = result.message_id
-            # 3. Track the streaming card state
+            # 3. Add "Typing" reaction to the original message (best-effort)
+            typing_reaction_id: Optional[str] = None
+            if reply_to:
+                try:
+                    react_body = (
+                        CreateMessageReactionRequestBody.builder()
+                        .reaction_type(
+                            Emoji.builder().emoji_type(_TYPING_EMOJI_TYPE).build()
+                        )
+                        .build()
+                    )
+                    react_req = (
+                        CreateMessageReactionRequest.builder()
+                        .message_id(reply_to)
+                        .request_body(react_body)
+                        .build()
+                    )
+                    react_resp = await asyncio.to_thread(
+                        self._client.im.v1.message_reaction.create, react_req,
+                    )
+                    if react_resp and react_resp.code == 0:
+                        typing_reaction_id = getattr(react_resp.data, "reaction_id", None)
+                        logger.debug("[Feishu] Added Typing reaction to %s → %s",
+                                     reply_to, typing_reaction_id)
+                except Exception as react_exc:
+                    logger.debug("[Feishu] Failed to add Typing reaction: %s", react_exc)
+
+            # 4. Track the streaming card state
             sc = _FeishuStreamingCard(
                 card_id=card_id,
                 element_id=_STREAMING_CARD_ELEMENT_ID,
                 message_id=message_id,
                 sequence=1,
                 created_at=time.time(),
+                typing_reaction_id=typing_reaction_id,
+                reply_to_message_id=reply_to,
             )
             self._streaming_cards[message_id] = sc
             logger.debug("[Feishu] Streaming card %s linked to message %s", card_id, message_id)
@@ -1711,6 +1749,23 @@ class FeishuAdapter(BasePlatformAdapter):
             if update_resp and update_resp.code != 0:
                 logger.warning("[Feishu] Failed to replace final card body: code=%s msg=%s",
                                getattr(update_resp, "code", "?"), getattr(update_resp, "msg", "?"))
+
+            # Step 3: remove "Typing" reaction from original message (best-effort)
+            if sc.typing_reaction_id and sc.reply_to_message_id:
+                try:
+                    del_req = (
+                        DeleteMessageReactionRequest.builder()
+                        .message_id(sc.reply_to_message_id)
+                        .reaction_id(sc.typing_reaction_id)
+                        .build()
+                    )
+                    await asyncio.to_thread(
+                        self._client.im.v1.message_reaction.delete, del_req,
+                    )
+                    logger.debug("[Feishu] Removed Typing reaction from %s",
+                                 sc.reply_to_message_id)
+                except Exception as del_exc:
+                    logger.debug("[Feishu] Failed to remove Typing reaction: %s", del_exc)
 
             if resp and resp.code == 0:
                 logger.debug("[Feishu] Stopped streaming card %s", sc.card_id)
