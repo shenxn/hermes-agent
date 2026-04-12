@@ -79,6 +79,8 @@ try:
         ContentCardElementRequestBody,
         SettingsCardRequest,
         SettingsCardRequestBody,
+        UpdateCardRequest,
+        UpdateCardRequestBody,
     )
     from lark_oapi.event.callback.model.p2_card_action_trigger import P2CardActionTriggerResponse
     from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
@@ -1622,9 +1624,15 @@ class FeishuAdapter(BasePlatformAdapter):
     async def stop_streaming_card(self, message_id: str) -> bool:
         """Disable streaming mode on a card and clean up tracking state.
 
+        Replaces the entire card body with one that contains only the text
+        element (no loading indicator). This mirrors the OpenClaw plugin's
+        closeStreamingAndUpdate → updateCardKitCard flow.
+
         Returns *True* on success.  Safe to call even if the message is not a
         streaming card (returns *True* immediately).
         """
+        from lark_oapi.api.cardkit.v1.model.card import Card
+
         sc = self._streaming_cards.pop(message_id, None)
         if sc is None:
             return True
@@ -1650,28 +1658,46 @@ class FeishuAdapter(BasePlatformAdapter):
                 self._client.cardkit.v1.card.settings, req,
             )
 
-            # Step 2: clear the loading indicator element
+            # Step 2: replace entire card body (removes loading indicator)
+            # Build a final card with only the text element — no loading icon.
+            final_card_json = {
+                "schema": "2.0",
+                "config": {"streaming_mode": False},
+                "body": {
+                    "elements": [
+                        {
+                            "tag": "markdown",
+                            "content": sc.last_sent_content,
+                            "element_id": _STREAMING_CARD_ELEMENT_ID,
+                        }
+                    ],
+                },
+            }
             sc.sequence += 1
-            clear_body = (
-                ContentCardElementRequestBody.builder()
+            update_body = (
+                UpdateCardRequestBody.builder()
+                .card(
+                    Card.builder()
+                    .type("card_json")
+                    .data(json.dumps(final_card_json, ensure_ascii=False))
+                    .build()
+                )
                 .uuid(str(uuid.uuid4()))
                 .sequence(sc.sequence)
-                .content("")
                 .build()
             )
-            clear_req = (
-                ContentCardElementRequest.builder()
+            update_req = (
+                UpdateCardRequest.builder()
                 .card_id(sc.card_id)
-                .element_id(_STREAMING_LOADING_ELEMENT_ID)
-                .request_body(clear_body)
+                .request_body(update_body)
                 .build()
             )
-            clear_resp = await asyncio.to_thread(
-                self._client.cardkit.v1.card_element.content, clear_req,
+            update_resp = await asyncio.to_thread(
+                self._client.cardkit.v1.card.update, update_req,
             )
-            if clear_resp and clear_resp.code != 0:
-                logger.warning("[Feishu] Failed to clear loading element: code=%s msg=%s",
-                               getattr(clear_resp, "code", "?"), getattr(clear_resp, "msg", "?"))
+            if update_resp and update_resp.code != 0:
+                logger.warning("[Feishu] Failed to replace final card body: code=%s msg=%s",
+                               getattr(update_resp, "code", "?"), getattr(update_resp, "msg", "?"))
 
             if resp and resp.code == 0:
                 logger.debug("[Feishu] Stopped streaming card %s", sc.card_id)
