@@ -2465,6 +2465,30 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.warning("[Feishu] Failed to add ack reaction to %s", message_id, exc_info=True)
         return None
 
+    async def _get_message_reactions(self, message_id: str) -> Optional[List[Any]]:
+        """List all reactions on a message, for looking up a reaction_id by emoji_type."""
+        if not self._client or not message_id:
+            return None
+        try:
+            from lark_oapi.api.im.v1 import ListMessageReactionRequest  # lazy import
+            request = (
+                ListMessageReactionRequest.builder()
+                .message_id(message_id)
+                .build()
+            )
+            response = await asyncio.to_thread(
+                self._client.im.v1.message_reaction.list, request,
+            )
+            if response and getattr(response, "success", lambda: False)():
+                data = getattr(response, "data", None)
+                items = getattr(data, "items", None)
+                return list(items) if items else []
+            logger.debug("[Feishu] Failed to list reactions on %s: code=%s",
+                        message_id, getattr(response, "code", None))
+        except Exception:
+            logger.debug("[Feishu] Failed to get message reactions", exc_info=True)
+        return None
+
     # =========================================================================
     # Webhook server and security
     # =========================================================================
