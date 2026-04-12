@@ -206,6 +206,8 @@ _ONBOARD_REQUEST_TIMEOUT_S = 10
 # ---------------------------------------------------------------------------
 
 _STREAMING_CARD_ELEMENT_ID = "streaming_md_1"
+_STREAMING_LOADING_ELEMENT_ID = "streaming_loading"
+_STREAMING_LOADING_ICON_KEY = "img_v3_02vb_496bec09-4b43-4773-ad6b-0cdd103cd2bg"
 _STREAMING_CARD_PRINT_FREQUENCY_MS = 50
 _STREAMING_CARD_PRINT_STEP = 2
 _STREAMING_CARD_PRINT_STRATEGY = "fast"
@@ -1676,7 +1678,16 @@ class FeishuAdapter(BasePlatformAdapter):
                         "tag": "markdown",
                         "content": initial_content,
                         "element_id": _STREAMING_CARD_ELEMENT_ID,
-                    }
+                    },
+                    {
+                        "tag": "markdown",
+                        "content": "",
+                        "custom_icon": {
+                            "tag": "custom_icon",
+                            "img_key": _STREAMING_LOADING_ICON_KEY,
+                        },
+                        "element_id": _STREAMING_LOADING_ELEMENT_ID,
+                    },
                 ],
             },
         }
