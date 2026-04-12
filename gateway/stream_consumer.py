@@ -87,6 +87,8 @@ class GatewayStreamConsumer:
         self._flood_strikes = 0         # Consecutive flood-control edit failures
         self._current_edit_interval = self.cfg.edit_interval  # Adaptive backoff
         self._final_response_sent = False
+        # Feishu CardKit streaming card support
+        self._uses_streaming_card = getattr(adapter, "streaming_cards_enabled", False) is True
 
     @property
     def already_sent(self) -> bool:
@@ -222,11 +224,14 @@ class GatewayStreamConsumer:
                             # continuation without dropping content.
                             break
                         self._accumulated = self._accumulated[split_at:].lstrip("\n")
+                        # Stop the current streaming card before starting a new one
+                        await self._stop_streaming_card_if_active()
                         self._message_id = None
                         self._last_sent_text = ""
 
                     display_text = self._accumulated
-                    if not got_done and not got_segment_break and commentary_text is None:
+                    display_text = self._accumulated
+                    if not got_done and not got_segment_break and commentary_text is None and not self._uses_streaming_card:
                         display_text += self.cfg.cursor
 
                     current_update_visible = await self._send_or_edit(display_text)
@@ -246,6 +251,9 @@ class GatewayStreamConsumer:
                             self._final_response_sent = await self._send_or_edit(self._accumulated)
                         elif not self._already_sent:
                             self._final_response_sent = await self._send_or_edit(self._accumulated)
+                            await self._send_or_edit(self._accumulated)
+                    # Finalize any active streaming card
+                    await self._stop_streaming_card_if_active()
                     return
 
                 if commentary_text is not None:
@@ -270,6 +278,12 @@ class GatewayStreamConsumer:
                 # still resets and creates a fresh segment as intended.)
                 if got_segment_break:
                     self._reset_segment_state(preserve_no_edit=True)
+                    await self._stop_streaming_card_if_active()
+                    self._message_id = None
+                    self._accumulated = ""
+                    self._last_sent_text = ""
+                    self._fallback_final_send = False
+                    self._fallback_prefix = ""
 
                 await asyncio.sleep(0.05)  # Small yield to not busy-loop
 
@@ -280,8 +294,16 @@ class GatewayStreamConsumer:
                     await self._send_or_edit(self._accumulated)
                 except Exception:
                     pass
+            try:
+                await self._stop_streaming_card_if_active()
+            except Exception:
+                pass
         except Exception as e:
             logger.error("Stream consumer error: %s", e)
+            try:
+                await self._stop_streaming_card_if_active()
+            except Exception:
+                pass
 
     # Pattern to strip MEDIA:<path> tags (including optional surrounding quotes).
     # Matches the simple cleanup regex used by the non-streaming path in
@@ -566,6 +588,20 @@ class GatewayStreamConsumer:
                         self._message_id = result.message_id
                     else:
                         self._edit_supported = False
+                if self._uses_streaming_card:
+                    result = await self.adapter.send_streaming_card(
+                        chat_id=self.chat_id,
+                        content=text,
+                        metadata=self.metadata,
+                    )
+                else:
+                    result = await self.adapter.send(
+                        chat_id=self.chat_id,
+                        content=text,
+                        metadata=self.metadata,
+                    )
+                if result.success and result.message_id:
+                    self._message_id = result.message_id
                     self._already_sent = True
                     self._last_sent_text = text
                     if not result.message_id:
@@ -583,3 +619,10 @@ class GatewayStreamConsumer:
         except Exception as e:
             logger.error("Stream send/edit error: %s", e)
             return False
+
+    async def _stop_streaming_card_if_active(self) -> None:
+        """Stop the streaming card if the adapter supports it and one is active."""
+        if self._uses_streaming_card and self._message_id is not None:
+            stop_fn = getattr(self.adapter, "stop_streaming_card", None)
+            if stop_fn is not None:
+                await stop_fn(self._message_id)

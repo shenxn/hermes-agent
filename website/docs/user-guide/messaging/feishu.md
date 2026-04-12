@@ -279,13 +279,32 @@ File upload routing is automatic based on extension:
 - `.pdf`, `.doc(x)`, `.xls(x)`, `.ppt(x)` → uploaded with their document type
 - Everything else → uploaded as a generic stream file
 
-## Markdown Rendering and Post Fallback
+## Markdown Rendering and Card Fallback
 
-When outbound text contains markdown formatting (headings, bold, lists, code blocks, links, etc.), the adapter automatically sends it as a Feishu **post** message with an embedded `md` tag rather than as plain text. This enables rich rendering in the Feishu client.
+When outbound text contains markdown formatting (headings, bold, lists, code blocks, links, etc.), the adapter automatically sends it as a Feishu **Card 2.0** interactive message with a `markdown` element rather than as plain text. This enables rich rendering — including tables — in the Feishu client.
 
-If the Feishu API rejects the post payload (e.g., due to unsupported markdown constructs), the adapter automatically falls back to sending as plain text with markdown stripped. This two-stage fallback ensures messages are always delivered.
+If the Feishu API rejects the card payload (e.g., due to unsupported markdown constructs), the adapter automatically falls back to sending as plain text with markdown stripped. This two-stage fallback ensures messages are always delivered.
 
 Plain text messages (no markdown detected) are sent as the simple `text` message type.
+
+## Streaming Cards (Typewriter Effect)
+
+When streaming is enabled in `config.yaml`, the Feishu adapter uses **CardKit streaming cards** to deliver a native typewriter effect. Instead of repeatedly editing a message, the adapter:
+
+```yaml
+streaming:
+  enabled: true
+```
+
+1. Creates a streaming card via the CardKit API with `streaming_mode: true`
+2. Appends content progressively via the CardKit element content API
+3. Finalizes the card by disabling streaming mode when the response completes
+
+This provides a smooth, real-time typing animation with a native loading indicator — no cursor character (`▉`) is needed. The chat list preview shows `[生成中...]` while the response is being generated.
+
+:::tip
+Streaming is strongly recommended for Feishu. Other platforms (Telegram, Discord, etc.) use progressive message edits with a cursor character, but Feishu's CardKit provides a much smoother native experience.
+:::
 
 ## ACK Emoji Reactions
 
@@ -439,7 +458,8 @@ WebSocket and per-group ACL settings are configured via `config.yaml` under `pla
 | Bot doesn't respond in groups | Ensure the bot is @mentioned, check `FEISHU_GROUP_POLICY`, and verify the sender is in `FEISHU_ALLOWED_USERS` if policy is `allowlist` |
 | `Webhook rejected: invalid verification token` | Ensure `FEISHU_VERIFICATION_TOKEN` matches the token in your Feishu app's Event Subscriptions config |
 | `Webhook rejected: invalid signature` | Ensure `FEISHU_ENCRYPT_KEY` matches the encrypt key in your Feishu app config |
-| Post messages show as plain text | The Feishu API rejected the post payload; this is normal fallback behavior. Check logs for details. |
+| Card messages show as plain text | The Feishu API rejected the card payload; this is normal fallback behavior. Check logs for details. |
+| Streaming cards not working | Ensure `streaming.enabled: true` in `config.yaml` and that `lark_oapi` is installed with CardKit support. |
 | Images/files not received by bot | Grant `im:message` and `im:resource` permission scopes to your Feishu app |
 | Bot identity not auto-detected | Grant `admin:app.info:readonly` scope, or set `FEISHU_BOT_OPEN_ID` / `FEISHU_BOT_NAME` manually |
 | Error 200340 when clicking approval buttons | Enable **Interactive Card** capability and configure **Card Request URL** in the Feishu Developer Console. See [Required Feishu App Configuration](#required-feishu-app-configuration) above. |
