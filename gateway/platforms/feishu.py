@@ -349,6 +349,7 @@ class _FeishuStreamingCard:
     message_id: str
     sequence: int = 1  # Strictly increasing across all card operations
     last_sent_content: str = ""  # Track what was last sent for delta optimization
+    created_at: float = 0.0  # When the card was created (for elapsed time)
 
 
 # ---------------------------------------------------------------------------
@@ -1557,6 +1558,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 element_id=_STREAMING_CARD_ELEMENT_ID,
                 message_id=message_id,
                 sequence=1,
+                created_at=time.time(),
             )
             self._streaming_cards[message_id] = sc
             logger.debug("[Feishu] Streaming card %s linked to message %s", card_id, message_id)
@@ -1659,19 +1661,30 @@ class FeishuAdapter(BasePlatformAdapter):
             )
 
             # Step 2: replace entire card body (removes loading indicator)
-            # Build a final card with only the text element — no loading icon.
+            # Build a final card with text + footer (completed status + elapsed time)
+            elapsed_ms = (time.time() - sc.created_at) * 1000
+            elapsed_sec = elapsed_ms / 1000
+            elapsed_str = f"{elapsed_sec:.1f}s" if elapsed_sec < 60 else f"{int(elapsed_sec // 60)}m {int(elapsed_sec % 60)}s"
+            footer_content = (
+                f"✅ 已完成 · 耗时 {elapsed_str}"
+            )
+
+            final_elements = [
+                {
+                    "tag": "markdown",
+                    "content": sc.last_sent_content,
+                    "element_id": _STREAMING_CARD_ELEMENT_ID,
+                },
+                {
+                    "tag": "markdown",
+                    "content": footer_content,
+                    "text_size": "notation",
+                },
+            ]
             final_card_json = {
                 "schema": "2.0",
                 "config": {"streaming_mode": False},
-                "body": {
-                    "elements": [
-                        {
-                            "tag": "markdown",
-                            "content": sc.last_sent_content,
-                            "element_id": _STREAMING_CARD_ELEMENT_ID,
-                        }
-                    ],
-                },
+                "body": {"elements": final_elements},
             }
             sc.sequence += 1
             update_body = (
