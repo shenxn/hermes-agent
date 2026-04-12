@@ -1631,6 +1631,7 @@ class FeishuAdapter(BasePlatformAdapter):
         if not self._client:
             return False
         try:
+            # Step 1: disable streaming mode
             sc.sequence += 1
             settings_json = json.dumps({"config": {"streaming_mode": False}}, ensure_ascii=False)
             body = (
@@ -1648,6 +1649,30 @@ class FeishuAdapter(BasePlatformAdapter):
             resp = await asyncio.to_thread(
                 self._client.cardkit.v1.card.settings, req,
             )
+
+            # Step 2: clear the loading indicator element
+            sc.sequence += 1
+            clear_body = (
+                ContentCardElementRequestBody.builder()
+                .uuid(str(uuid.uuid4()))
+                .sequence(sc.sequence)
+                .content("")
+                .build()
+            )
+            clear_req = (
+                ContentCardElementRequest.builder()
+                .card_id(sc.card_id)
+                .element_id(_STREAMING_LOADING_ELEMENT_ID)
+                .request_body(clear_body)
+                .build()
+            )
+            clear_resp = await asyncio.to_thread(
+                self._client.cardkit.v1.card_element.content, clear_req,
+            )
+            if clear_resp and clear_resp.code != 0:
+                logger.warning("[Feishu] Failed to clear loading element: code=%s msg=%s",
+                               getattr(clear_resp, "code", "?"), getattr(clear_resp, "msg", "?"))
+
             if resp and resp.code == 0:
                 logger.debug("[Feishu] Stopped streaming card %s", sc.card_id)
                 return True
