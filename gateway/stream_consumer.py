@@ -179,11 +179,18 @@ class GatewayStreamConsumer:
                             break
                         # Injected tool-progress: append into accumulated stream text
                         if isinstance(item, tuple) and len(item) == 2 and item[0] is _INJECT:
-                            if self._accumulated and not self._accumulated.rstrip().endswith("\n"):
-                                self._accumulated += "\n\n"
+                            if self._accumulated and not self._accumulated.endswith("\n"):
+                                self._accumulated += "\n"
                             self._accumulated += item[1] + "\n"
                             logger.debug("[inject] ⬇ %s", item[1][:80])
                             continue
+                        # Regular text delta — skip leading newline if accumulated
+                        # already ends with one to avoid blank lines between tool
+                        # progress and model output.
+                        if self._accumulated.endswith("\n") and item.startswith("\n"):
+                            item = item.lstrip("\n")
+                            if not item:
+                                continue
                         self._accumulated += item
                     except queue.Empty:
                         break
