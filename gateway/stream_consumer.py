@@ -187,14 +187,18 @@ class GatewayStreamConsumer:
                                 "> " + line if line else ">"  # empty lines → bare ">"
                                 for line in item[1].split("\n")
                             )
-                            self._accumulated += quoted + "\n"
+                            # Two newlines after blockquote to close the quote
+                            # block in markdown; a single \n would cause the
+                            # next paragraph to be absorbed into the quote.
+                            self._accumulated += quoted + "\n\n"
                             logger.debug("[inject] ⬇ %s", item[1][:80])
                             continue
                         # Regular text delta — skip leading newline if accumulated
                         # already ends with one to avoid blank lines between tool
                         # progress and model output.
                         if self._accumulated.endswith("\n") and item.startswith("\n"):
-                            item = item.lstrip("\n")
+                            # Only strip one leading newline (keep one as paragraph break)
+                            item = item[1:] if len(item) > 1 else ""
                             if not item:
                                 continue
                         self._accumulated += item
