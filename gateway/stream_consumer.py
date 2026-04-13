@@ -91,6 +91,8 @@ class GatewayStreamConsumer:
         self._fallback_final_send = False
         self._fallback_prefix = ""
         self._flood_strikes = 0         # Consecutive flood-control edit failures
+        self._stream_closed_strikes = 0  # Consecutive 300309 streaming-closed failures
+        self._MAX_STREAM_CLOSED_STRIKES = 3  # Fallback to non-streaming after this many
         self._current_edit_interval = self.cfg.edit_interval  # Adaptive backoff
         self._final_response_sent = False
         # Feishu CardKit streaming card support
@@ -496,8 +498,20 @@ class GatewayStreamConsumer:
     def _is_flood_error(self, result) -> bool:
         """Check if a SendResult failure is due to flood control / rate limiting."""
         err = getattr(result, "error", "") or ""
-        err_lower = err.lower()
-        return "flood" in err_lower or "retry after" in err_lower or "rate" in err_lower
+        return ("flood" in err.lower() or "retry after" in err.lower()
+                or "rate" in err.lower())
+
+    def _is_streaming_closed_error(self, result) -> bool:
+        """Check if a SendResult failure is because the CardKit streaming session was closed.
+
+        Feishu returns code 300309 / 'streaming mode is closed' when the
+        server-side streaming session has ended (timeout, explicit stop,
+        or internal lifecycle).  This is *not* a fatal condition — we can
+        simply create a new CardKit card and continue streaming into it.
+        """
+        err = getattr(result, "error", "") or ""
+        return ("300309" in err
+                or "streaming mode is closed" in err.lower())
 
     async def _try_strip_cursor(self) -> None:
         """Best-effort edit to remove the cursor from the last visible message.
@@ -595,9 +609,47 @@ class GatewayStreamConsumer:
                                 self._last_edit_time = time.monotonic()
                                 return False
 
-                        # Non-flood error OR flood strikes exhausted: enter
-                        # fallback mode — send only the missing tail once the
-                        # final response is available.
+                        # Non-flood error OR flood strikes exhausted.
+                        # Check if it's a recoverable "card stream closed" —
+                        # reset and create a new card instead of buffering silently.
+                        if self._is_streaming_closed_error(result):
+                            self._stream_closed_strikes += 1
+                            if self._stream_closed_strikes >= self._MAX_STREAM_CLOSED_STRIKES:
+                                logger.warning(
+                                    "[stream-TRACE] Card stream closed (300309) "
+                                    "%d consecutive times — falling back to "
+                                    "non-streaming messages",
+                                    self._stream_closed_strikes,
+                                )
+                                self._uses_streaming_card = False
+                                self._fallback_prefix = self._visible_prefix()
+                                self._fallback_final_send = True
+                                self._edit_supported = False
+                                self._already_sent = True
+                                await self._try_strip_cursor()
+                                return False
+                            logger.warning(
+                                "[stream-TRACE] Card stream closed (300309) — "
+                                "resetting to create new card on next update (%d/%d)",
+                                self._stream_closed_strikes,
+                                self._MAX_STREAM_CLOSED_STRIKES,
+                            )
+                            # Reset so next cycle enters FIRST-SEND path.
+                            # Old card already shows prior content; new card
+                            # picks up from fresh queue items.
+                            # IMPORTANT: explicitly stop the old streaming session
+                            # so Feishu cleans up server-side state before we
+                            # attempt to create a new card.  Without this, the
+                            # new send_streaming_card() gets 300309 forever.
+                            await self._stop_streaming_card_if_active()
+                            self._message_id = None
+                            self._already_sent = False
+                            self._last_sent_text = ""
+                            self._accumulated = ""
+                            # Keep _edit_supported=True, don't set fallback flags
+                            return False
+
+                        # Other errors: enter fallback mode
                         logger.warning("[stream-TRACE] EDIT-FAILED (strikes=%d) entering fallback",
                                        self._flood_strikes)
                         self._fallback_prefix = self._visible_prefix()
@@ -634,6 +686,7 @@ class GatewayStreamConsumer:
                     self._message_id = result.message_id
                     self._already_sent = True
                     self._last_sent_text = text
+                    self._stream_closed_strikes = 0  # Reset on success
                     if not result.message_id:
                         self._fallback_prefix = self._visible_prefix()
                         self._fallback_final_send = True
@@ -643,7 +696,27 @@ class GatewayStreamConsumer:
                         self._message_id = "__no_edit__"
                     return True
                 else:
-                    # Initial send failed — disable streaming for this session
+                    # Initial send failed — check if it's a recoverable
+                    # "streaming mode closed" error (retry on next cycle)
+                    # vs a hard failure (disable streaming).
+                    if self._uses_streaming_card and self._is_streaming_closed_error(result):
+                        self._stream_closed_strikes += 1
+                        if self._stream_closed_strikes >= self._MAX_STREAM_CLOSED_STRIKES:
+                            logger.warning(
+                                "[stream-TRACE] FIRST-SEND card stream closed (300309) "
+                                "%d times — falling back to non-streaming",
+                                self._stream_closed_strikes,
+                            )
+                            self._uses_streaming_card = False
+                            return False
+                        logger.warning(
+                            "[stream-TRACE] FIRST-SEND card stream closed (300309) — "
+                            "will retry (%d/%d)",
+                            self._stream_closed_strikes,
+                            self._MAX_STREAM_CLOSED_STRIKES,
+                        )
+                        # Keep _message_id=None so we retry first-send on next cycle
+                        return False
                     self._edit_supported = False
                     return False
         except Exception as e:

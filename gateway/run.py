@@ -7481,8 +7481,33 @@ class GatewayRunner:
             if not progress_queue:
                 return
 
-            # Only act on tool.started events (ignore tool.completed, reasoning.available, etc.)
-            if event_type not in ("tool.started",):
+            # Handle reasoning/thinking events — show the model's natural-language
+            # intent description alongside tool calls.  Respects the
+            # display.show_reasoning config toggle (off by default).
+            if event_type == "_thinking" and self._show_reasoning:
+                # Single-line thinking from subagents — show as plain text
+                if preview and len(preview.strip()) > 1:
+                    progress_queue.put(f"💭 {preview}")
+                return
+
+            if event_type == "reasoning.available" and self._show_reasoning:
+                # Full reasoning block from the model.  Show the first non-empty
+                # line as an intent description (the rest is available via
+                # show_reasoning config if enabled).
+                if preview:
+                    first_line = preview.strip().split("\n")[0][:80]
+                    if first_line and len(first_line) > 1:
+                        progress_queue.put(f"💭 {first_line}")
+                return
+
+            # Always pass through _thinking/reasoning events even when hidden,
+            # so the progress queue consumer doesn't stall waiting for events
+            # that were silently swallowed.
+            if event_type in ("_thinking", "reasoning.available"):
+                return
+
+            # Only act on tool.started events (ignore tool.completed etc.)
+            if event_type != "tool.started":
                 return
 
             # "new" mode: only report when tool changes
@@ -8393,12 +8418,22 @@ class GatewayRunner:
                         _status_detail = " — " + ", ".join(_parts)
                     except Exception:
                         pass
+                _msg = f"⏳ Still working... ({_elapsed_mins} min elapsed{_status_detail})"
                 try:
-                    await _notify_adapter.send(
-                        source.chat_id,
-                        f"⏳ Still working... ({_elapsed_mins} min elapsed{_status_detail})",
-                        metadata=_status_thread_metadata,
-                    )
+                    # Prefer injecting into the streaming CardKit card so the
+                    # "still working" notification merges into the existing
+                    # streaming output instead of appearing as a separate
+                    # message bubble.
+                    _sc_notify = stream_consumer_holder[0]
+                    if (_sc_notify
+                            and getattr(_sc_notify.cfg, 'merge_segments', True)):
+                        _sc_notify.inject(_msg)
+                    else:
+                        await _notify_adapter.send(
+                            source.chat_id,
+                            _msg,
+                            metadata=_status_thread_metadata,
+                        )
                 except Exception as _ne:
                     logger.debug("Long-running notification error: %s", _ne)
 
@@ -8486,14 +8521,23 @@ class GatewayRunner:
                             _elapsed_warn = int(_agent_warning // 60) or 1
                             _remaining_mins = int((_agent_timeout - _agent_warning) // 60) or 1
                             try:
-                                await _warn_adapter.send(
-                                    source.chat_id,
+                                _warn_msg = (
                                     f"⚠️ No activity for {_elapsed_warn} min. "
                                     f"If the agent does not respond soon, it will "
                                     f"be timed out in {_remaining_mins} min. "
-                                    f"You can continue waiting or use /reset.",
-                                    metadata=_status_thread_metadata,
+                                    f"You can continue waiting or use /reset."
                                 )
+                                # Inject into streaming card when available
+                                _sc_warn = stream_consumer_holder[0]
+                                if (_sc_warn
+                                        and getattr(_sc_warn.cfg, 'merge_segments', True)):
+                                    _sc_warn.inject(_warn_msg)
+                                else:
+                                    await _warn_adapter.send(
+                                        source.chat_id,
+                                        _warn_msg,
+                                        metadata=_status_thread_metadata,
+                                    )
                             except Exception as _warn_err:
                                 logger.debug("Inactivity warning send error: %s", _warn_err)
                     if _idle_secs >= _agent_timeout:

@@ -487,6 +487,9 @@ DEFAULT_CONFIG = {
             "api_key": "",
             "timeout": 30,
         },
+        "title_generation": {
+            "provider": "disabled",
+        },
     },
     
     "display": {

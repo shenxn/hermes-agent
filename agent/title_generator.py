@@ -92,6 +92,24 @@ def auto_title_session(
         logger.debug("Failed to set auto-generated title: %s", e)
 
 
+def _is_title_generation_disabled() -> bool:
+    """Check if auto title generation is disabled via config.
+
+    Set ``auxiliary.title_generation.provider: disabled`` in config.yaml
+    to suppress auto-titling entirely (useful when the default auxiliary
+    model is unavailable or when titles are not shown on the platform).
+    """
+    try:
+        from hermes_cli.config import load_config
+        config = load_config()
+        aux = config.get("auxiliary", {}) if isinstance(config, dict) else {}
+        task_cfg = aux.get("title_generation", {}) if isinstance(aux, dict) else {}
+        provider = str(task_cfg.get("provider", "")).strip().lower()
+        return provider == "disabled"
+    except Exception:
+        return False
+
+
 def maybe_auto_title(
     session_db,
     session_id: str,
@@ -104,7 +122,11 @@ def maybe_auto_title(
     Only generates a title when:
     - This appears to be the first user→assistant exchange
     - No title is already set
+    - Title generation is not disabled via config
     """
+    if _is_title_generation_disabled():
+        return
+
     if not session_db or not session_id or not user_message or not assistant_response:
         return
 
