@@ -178,10 +178,16 @@ class GatewayStreamConsumer:
                             commentary_text = item[1]
                             break
                         # Injected tool-progress: append into accumulated stream text
+                        # as markdown blockquote for visual separation from model output.
                         if isinstance(item, tuple) and len(item) == 2 and item[0] is _INJECT:
                             if self._accumulated and not self._accumulated.endswith("\n"):
                                 self._accumulated += "\n"
-                            self._accumulated += item[1] + "\n"
+                            # Prefix each line with "> " for blockquote formatting
+                            quoted = "\n".join(
+                                "> " + line if line else ">"  # empty lines → bare ">"
+                                for line in item[1].split("\n")
+                            )
+                            self._accumulated += quoted + "\n"
                             logger.debug("[inject] ⬇ %s", item[1][:80])
                             continue
                         # Regular text delta — skip leading newline if accumulated
