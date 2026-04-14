@@ -10077,6 +10077,10 @@ class AIAgent:
                                 }
 
                     if self.compression_enabled and _compressor.should_compress(_real_tokens):
+                        logger.info(
+                            "Context compression triggered: _real_tokens=%s threshold=%s last_prompt=%s",
+                            _real_tokens, _compressor.threshold_tokens, _compressor.last_prompt_tokens,
+                        )
                         self._safe_print("  ⟳ compacting context…")
                         messages, active_system_prompt = self._compress_context(
                             messages, system_message,
@@ -10087,6 +10091,13 @@ class AIAgent:
                         # _flush_messages_to_session_db writes compressed messages
                         # to the new session (see preflight compression comment).
                         conversation_history = None
+                    else:
+                        logger.info(
+                            "Compression check: real_tokens=%s threshold=%s enabled=%s last_prompt=%s msgs=%d",
+                            _real_tokens, _compressor.threshold_tokens,
+                            self.compression_enabled, _compressor.last_prompt_tokens,
+                            len(messages),
+                        )
                     
                     # Save session log incrementally (so progress is visible even if interrupted)
                     self._session_messages = messages

@@ -7769,6 +7769,10 @@ class GatewayRunner:
         _status_adapter = self.adapters.get(source.platform)
         _status_chat_id = source.chat_id
         _status_thread_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
+        # Pre-declare in outer scope so _status_callback_sync closure can see them.
+        # run_sync() uses `nonlocal` to reassign after creating the stream consumer.
+        _stream_consumer = None
+        _scfg = None
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             # When streaming + merge_segments is active, inject tool progress
@@ -7809,7 +7813,7 @@ class GatewayRunner:
             # read *and* reassign the outer `_run_agent` parameter without
             # triggering an UnboundLocalError on the earlier read at
             # `_resolve_turn_agent_config(message, …)`.
-            nonlocal message
+            nonlocal message, _stream_consumer, _scfg
 
             # session_key is now set via contextvars in _set_session_env()
             # (concurrency-safe). Keep os.environ as fallback for CLI/cron.
