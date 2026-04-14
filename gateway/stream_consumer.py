@@ -97,6 +97,7 @@ class GatewayStreamConsumer:
         self._final_response_sent = False
         # Feishu CardKit streaming card support
         self._uses_streaming_card = getattr(adapter, "streaming_cards_enabled", False) is True
+        self._has_new_content = False   # Set True on new deltas, cleared after successful edit
 
     @property
     def already_sent(self) -> bool:
@@ -125,6 +126,7 @@ class GatewayStreamConsumer:
         streaming message (CardKit card or edited message).
         """
         if text:
+            self._has_new_content = True
             logger.debug("[inject] → %s", text[:120])
             self._queue.put((_INJECT, text))
 
@@ -145,6 +147,7 @@ class GatewayStreamConsumer:
         appears below any tool-progress messages the gateway sent in between.
         """
         if text:
+            self._has_new_content = True
             self._queue.put(text)
         elif text is None:
             self.on_segment_break()
@@ -218,7 +221,7 @@ class GatewayStreamConsumer:
                     or (got_segment_break and not _merge)  # skip boundary flush when merged
                     or commentary_text is not None
                     or (elapsed >= self._current_edit_interval
-                        and self._accumulated)
+                        and self._has_new_content)
                     or len(self._accumulated) >= self.cfg.buffer_threshold
                 )
 
@@ -584,12 +587,12 @@ class GatewayStreamConsumer:
             return True  # nothing to send is "success"
         try:
             if self._message_id is not None:
-                logger.info("[stream-TRACE] EDIT path msg=%s len=%d fallback=%s edit_sup=%s",
-                            self._message_id, len(text), self._fallback_final_send, self._edit_supported)
                 if self._edit_supported:
                     # Skip if text is identical to what we last sent
                     if text == self._last_sent_text:
                         return True
+                    logger.debug("[stream-TRACE] EDIT path msg=%s len=%d fallback=%s edit_sup=%s",
+                                self._message_id, len(text), self._fallback_final_send, self._edit_supported)
                     # Edit existing message
                     result = await self.adapter.edit_message(
                         chat_id=self.chat_id,
@@ -599,6 +602,7 @@ class GatewayStreamConsumer:
                     if result.success:
                         self._already_sent = True
                         self._last_sent_text = text
+                        self._has_new_content = False  # Reset — content is now up-to-date
                         # Successful edit — reset flood strike counter
                         self._flood_strikes = 0
                         return True
@@ -703,6 +707,7 @@ class GatewayStreamConsumer:
                     self._message_id = result.message_id
                     self._already_sent = True
                     self._last_sent_text = text
+                    self._has_new_content = False  # Reset after first send
                     self._stream_closed_strikes = 0  # Reset on success
                     if not result.message_id:
                         self._fallback_prefix = self._visible_prefix()
