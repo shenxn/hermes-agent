@@ -1600,6 +1600,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 created_at=time.time(),
                 typing_reaction_id=typing_reaction_id,
                 reply_to_message_id=reply_to,
+                last_sent_content=content,  # Track initial content for stop_streaming_card
             )
             self._streaming_cards[message_id] = sc
             logger.debug("[Feishu] Streaming card %s linked to message %s", card_id, message_id)

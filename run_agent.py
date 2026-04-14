@@ -91,7 +91,7 @@ from agent.model_metadata import (
     save_context_length, is_local_endpoint,
     query_ollama_num_ctx,
 )
-from agent.context_compressor import ContextCompressor
+from agent.context_compressor import ContextCompressor, CompressionFailedError
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
@@ -6733,11 +6733,15 @@ class AIAgent:
             (compressed_messages, new_system_prompt) tuple
         """
         _pre_msg_count = len(messages)
+        _tok_str = f"{approx_tokens:,}" if approx_tokens else "unknown"
         logger.info(
             "context compression started: session=%s messages=%d tokens=~%s model=%s focus=%r",
             self.session_id or "none", _pre_msg_count,
-            f"{approx_tokens:,}" if approx_tokens else "unknown", self.model,
+            _tok_str, self.model,
             focus_topic,
+        )
+        self._emit_status(
+            f"🔄 Compressing context ({_pre_msg_count} messages, ~{_tok_str} tokens)..."
         )
         # Pre-compression memory flush: let the model save memories before they're lost
         self.flush_memories(messages, min_turns=0)
@@ -6749,7 +6753,14 @@ class AIAgent:
             except Exception:
                 pass
 
-        compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic)
+        try:
+            compressed = self.context_compressor.compress(messages, current_tokens=approx_tokens, focus_topic=focus_topic)
+        except CompressionFailedError as e:
+            logger.warning("Compression aborted: %s — returning original context unchanged.", e)
+            self._emit_status(
+                "⚠ Compression failed, context preserved. You can retry or /new to start fresh."
+            )
+            return messages, system_message
 
         todo_snapshot = self._todo_store.format_for_injection()
         if todo_snapshot:

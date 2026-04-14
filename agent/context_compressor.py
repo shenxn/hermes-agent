@@ -57,6 +57,14 @@ _CHARS_PER_TOKEN = 4
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
 
 
+class CompressionFailedError(Exception):
+    """Raised when context compression fails and cannot produce a usable summary.
+
+    The caller should return the original messages unchanged rather than
+    silently dropping middle turns without a summary.
+    """
+
+
 class ContextCompressor(ContextEngine):
     """Default context engine — compresses conversation context via lossy summarization.
 
@@ -439,22 +447,23 @@ Use this exact structure:
 FOCUS TOPIC: "{focus_topic}"
 The user has requested that this compaction PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget."""
 
+        call_kwargs = {
+            "task": "compression",
+            "main_runtime": {
+                "model": self.model,
+                "provider": self.provider,
+                "base_url": self.base_url,
+                "api_key": self.api_key,
+                "api_mode": self.api_mode,
+            },
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": summary_budget * 2,
+            # timeout resolved from auxiliary.compression.timeout config by call_llm
+        }
+        if self.summary_model:
+            call_kwargs["model"] = self.summary_model
+
         try:
-            call_kwargs = {
-                "task": "compression",
-                "main_runtime": {
-                    "model": self.model,
-                    "provider": self.provider,
-                    "base_url": self.base_url,
-                    "api_key": self.api_key,
-                    "api_mode": self.api_mode,
-                },
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": summary_budget * 2,
-                # timeout resolved from auxiliary.compression.timeout config by call_llm
-            }
-            if self.summary_model:
-                call_kwargs["model"] = self.summary_model
             response = call_llm(**call_kwargs)
             content = response.choices[0].message.content
             # Handle cases where content is not a string (e.g., dict from llama.cpp)
@@ -466,19 +475,36 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             self._summary_failure_cooldown_until = 0.0
             return self._with_summary_prefix(summary)
         except RuntimeError:
-            self._summary_failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SECONDS
-            logging.warning("Context compression: no provider available for "
-                            "summary. Middle turns will be dropped without summary "
-                            "for %d seconds.",
-                            _SUMMARY_FAILURE_COOLDOWN_SECONDS)
-            return None
+            logging.warning(
+                "Context compression: no provider available for summary (attempt 1/2)."
+            )
         except Exception as e:
+            logging.warning(
+                "Failed to generate context summary (attempt 1/2): %s", e,
+            )
+        else:
+            return self._with_summary_prefix(summary)
+
+        # Retry once after a short delay
+        logging.info("Retrying context compression in 3s...")
+        time.sleep(3)
+        try:
+            response = call_llm(**call_kwargs)
+            content = response.choices[0].message.content
+            if not isinstance(content, str):
+                content = str(content) if content else ""
+            summary = content.strip()
+            self._previous_summary = summary
+            self._summary_failure_cooldown_until = 0.0
+            logging.info("Context compression retry succeeded.")
+            return self._with_summary_prefix(summary)
+        except Exception as e2:
             self._summary_failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SECONDS
             logging.warning(
-                "Failed to generate context summary: %s. "
-                "Further summary attempts paused for %d seconds.",
-                e,
-                _SUMMARY_FAILURE_COOLDOWN_SECONDS,
+                "Context compression retry also failed: %s. "
+                "Aborting compression — original context will be preserved. "
+                "Further attempts paused for %d seconds.",
+                e2, _SUMMARY_FAILURE_COOLDOWN_SECONDS,
             )
             return None
 
@@ -751,18 +777,18 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 )
             compressed.append(msg)
 
-        # If LLM summary failed, insert a static fallback so the model
-        # knows context was lost rather than silently dropping everything.
+        # If LLM summary failed (both attempts), abort compression entirely.
+        # Returning original messages unchanged is better than silently dropping
+        # turns without any summary — the user can retry manually.
         if not summary:
             if not self.quiet_mode:
-                logger.warning("Summary generation failed — inserting static fallback context marker")
-            n_dropped = compress_end - compress_start
-            summary = (
-                f"{SUMMARY_PREFIX}\n"
-                f"Summary generation was unavailable. {n_dropped} conversation turns were "
-                f"removed to free context space but could not be summarized. The removed "
-                f"turns contained earlier work in this session. Continue based on the "
-                f"recent messages below and the current state of any files or resources."
+                logger.warning(
+                    "Summary generation failed after retry — aborting compression, "
+                    "returning original context unchanged."
+                )
+            raise CompressionFailedError(
+                f"Failed to generate summary for {compress_end - compress_start} turns. "
+                "Original context preserved — retry later or start a new session."
             )
 
         _merge_summary_into_tail = False

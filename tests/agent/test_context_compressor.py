@@ -3,7 +3,7 @@
 import pytest
 from unittest.mock import patch, MagicMock
 
-from agent.context_compressor import ContextCompressor, SUMMARY_PREFIX
+from agent.context_compressor import ContextCompressor, SUMMARY_PREFIX, CompressionFailedError
 
 
 @pytest.fixture()
@@ -65,24 +65,25 @@ class TestCompress:
         assert result == msgs
 
     def test_truncation_fallback_no_client(self, compressor):
-        # compressor has client=None, so should use truncation fallback
+        # When summary generation fails, compress should raise CompressionFailedError
+        # instead of silently dropping turns without a summary.
         msgs = [{"role": "system", "content": "System prompt"}] + self._make_messages(10)
-        result = compressor.compress(msgs)
-        assert len(result) < len(msgs)
-        # Should keep system message and last N
-        assert result[0]["role"] == "system"
-        assert compressor.compression_count == 1
+        with pytest.raises(CompressionFailedError):
+            compressor.compress(msgs)
 
     def test_compression_increments_count(self, compressor):
         msgs = self._make_messages(10)
-        compressor.compress(msgs)
+        with patch.object(compressor, "_generate_summary", return_value="Summary text"):
+            compressor.compress(msgs)
         assert compressor.compression_count == 1
-        compressor.compress(msgs)
+        with patch.object(compressor, "_generate_summary", return_value="Summary text"):
+            compressor.compress(msgs)
         assert compressor.compression_count == 2
 
     def test_protects_first_and_last(self, compressor):
         msgs = self._make_messages(10)
-        result = compressor.compress(msgs)
+        with patch.object(compressor, "_generate_summary", return_value="Summary text"):
+            result = compressor.compress(msgs)
         # First 2 messages should be preserved (protect_first_n=2)
         # Last 2 messages should be preserved (protect_last_n=2)
         assert result[-1]["content"] == msgs[-1]["content"]
@@ -128,7 +129,8 @@ class TestGenerateSummaryNoneContent:
             {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
             for i in range(10)
         ]
-        result = c.compress(msgs)
+        with patch.object(c, "_generate_summary", return_value="Summary text"):
+            result = c.compress(msgs)
         assert len(result) < len(msgs)
 
 
@@ -233,13 +235,16 @@ class TestSummaryFailureCooldown:
             {"role": "assistant", "content": "ok"},
         ]
 
+        # First call: attempts 1 + retry = 2 call_llm invocations, both fail
         with patch("agent.context_compressor.call_llm", side_effect=Exception("boom")) as mock_call:
             first = c._generate_summary(messages)
+            # Cooldown is active now — second call should skip entirely
             second = c._generate_summary(messages)
 
         assert first is None
         assert second is None
-        assert mock_call.call_count == 1
+        # 2 calls from first _generate_summary (attempt + retry), 0 from second (cooldown)
+        assert mock_call.call_count == 2
 
 
 class TestSummaryPrefixNormalization:
