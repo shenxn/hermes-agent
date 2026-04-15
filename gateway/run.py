@@ -7506,6 +7506,20 @@ class GatewayRunner:
             if event_type in ("_thinking", "reasoning.available"):
                 return
 
+            # Relay subagent progress from delegate_task — these carry
+            # child-agent tool names and lifecycle status so the user can
+            # see what's happening inside a delegation.
+            if event_type == "subagent_progress" and preview:
+                _sc = stream_consumer_holder[0]
+                if _sc and getattr(_sc.cfg, 'merge_segments', True):
+                    try:
+                        _sc.inject(preview)
+                    except Exception:
+                        pass
+                elif progress_queue:
+                    progress_queue.put(preview)
+                return
+
             # Only act on tool.started events (ignore tool.completed etc.)
             if event_type != "tool.started":
                 return

@@ -174,10 +174,6 @@ def _build_child_progress_callback(task_index: int, parent_agent, task_count: in
     # Show 1-indexed prefix only in batch mode (multiple tasks)
     prefix = f"[{task_index + 1}] " if task_count > 1 else ""
 
-    # Gateway: batch tool names, flush periodically
-    _BATCH_SIZE = 5
-    _batch: List[str] = []
-
     def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
         # event_type is one of: "tool.started", "tool.completed",
         # "reasoning.available", "_thinking", "subagent_progress"
@@ -198,7 +194,7 @@ def _build_child_progress_callback(task_index: int, parent_agent, task_count: in
         if event_type == "tool.completed":
             return
 
-        # tool.started — display and batch for parent relay
+        # tool.started — relay immediately to gateway (no batching)
         if spinner:
             short = (preview[:35] + "...") if preview and len(preview) > 35 else (preview or "")
             from agent.display import get_tool_emoji
@@ -212,26 +208,19 @@ def _build_child_progress_callback(task_index: int, parent_agent, task_count: in
                 logger.debug("Spinner print_above failed: %s", e)
 
         if parent_cb:
-            _batch.append(tool_name or "")
-            if len(_batch) >= _BATCH_SIZE:
-                summary = ", ".join(_batch)
-                try:
-                    parent_cb("subagent_progress", f"🔀 {prefix}{summary}")
-                except Exception as e:
-                    logger.debug("Parent callback failed: %s", e)
-                _batch.clear()
-
-    def _flush():
-        """Flush remaining batched tool names to gateway on completion."""
-        if parent_cb and _batch:
-            summary = ", ".join(_batch)
+            from agent.display import get_tool_emoji
+            emoji = get_tool_emoji(tool_name or "")
+            short = (preview[:35] + "...") if preview and len(preview) > 35 else (preview or "")
+            label = f"{emoji} {tool_name}"
+            if short:
+                label += f": \"{short}\""
             try:
-                parent_cb("subagent_progress", f"🔀 {prefix}{summary}")
+                parent_cb("subagent_progress", preview=f"🔀 {prefix}{label}")
             except Exception as e:
-                logger.debug("Parent callback flush failed: %s", e)
-            _batch.clear()
+                logger.debug("Parent callback failed: %s", e)
 
-    _callback._flush = _flush
+    # No-op flush — no batch to drain
+    _callback._flush = lambda: None
     return _callback
 
 
@@ -409,6 +398,17 @@ def _run_single_child(
     """
     child_start = time.monotonic()
 
+    # Notify gateway that subagent is starting (Plan C)
+    _parent_cb = getattr(parent_agent, 'tool_progress_callback', None) if parent_agent else None
+    task_count = getattr(parent_agent, '_delegate_task_count', 1) if parent_agent else 1
+    _task_idx = _kwargs.get('task_index', 0)
+    _pfx = f"[{_task_idx + 1}] " if task_count > 1 else ""
+    if _parent_cb:
+        try:
+            _parent_cb("subagent_progress", preview=f"🔀 {_pfx}子任务启动...")
+        except Exception:
+            pass
+
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, 'tool_progress_callback', None)
 
@@ -494,6 +494,15 @@ def _run_single_child(
             status = "completed"
         else:
             status = "failed"
+
+        # Notify gateway that subagent finished (Plan C)
+        if _parent_cb:
+            _status_icon = "✅" if status == "completed" else "⚠️"
+            _done_msg = f"🔀 {_pfx}{_status_icon} 子任务{status} ({duration}s, {api_calls}次调用)"
+            try:
+                _parent_cb("subagent_progress", preview=_done_msg)
+            except Exception:
+                pass
 
         # Build tool trace from conversation messages (already in memory).
         # Uses tool_call_id to correctly pair parallel tool calls with results.
@@ -696,6 +705,9 @@ def delegate_task(
     results = []
 
     n_tasks = len(task_list)
+    # Stash task count on parent so _run_single_child can use it for prefix
+    if parent_agent:
+        parent_agent._delegate_task_count = n_tasks
     # Track goal labels for progress display (truncated for readability)
     task_labels = [t["goal"][:40] for t in task_list]
 
