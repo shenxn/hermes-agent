@@ -1132,6 +1132,10 @@ class FeishuAdapter(BasePlatformAdapter):
         self._approval_counter = itertools.count(1)
         # CardKit streaming card state (message_id → _FeishuStreamingCard)
         self._streaming_cards: Dict[str, _FeishuStreamingCard] = {}
+        # Early typing reactions: inbound message_id → reaction_id
+        # Added immediately on receipt so users see typing before LLM TTFT.
+        # Handed off to streaming card or cleaned up on completion.
+        self._early_typing_reactions: Dict[str, str] = {}
         self._load_seen_message_ids()
 
     @staticmethod
@@ -1564,32 +1568,41 @@ class FeishuAdapter(BasePlatformAdapter):
 
             message_id = result.message_id
             # 3. Add "Typing" reaction to original message (best-effort)
-            #    Follows OpenClaw pattern: create → capture reaction_id → delete on complete
+            #    Follows OpenClaw pattern: create → capture reaction_id → delete on complete.
+            #    If an early typing reaction was already added in on_processing_start,
+            #    reuse it instead of creating a duplicate.
             typing_reaction_id: Optional[str] = None
             if reply_to:
-                try:
-                    react_body = (
-                        CreateMessageReactionRequestBody.builder()
-                        .reaction_type(
-                            Emoji.builder().emoji_type(_TYPING_EMOJI_TYPE).build()
+                # Check for an existing early typing reaction from on_processing_start
+                early_rid = self._early_typing_reactions.pop(reply_to, None)
+                if early_rid:
+                    typing_reaction_id = early_rid
+                    logger.debug("[Feishu] Reusing early typing reaction for %s → %s",
+                                 reply_to, typing_reaction_id)
+                else:
+                    try:
+                        react_body = (
+                            CreateMessageReactionRequestBody.builder()
+                            .reaction_type(
+                                Emoji.builder().emoji_type(_TYPING_EMOJI_TYPE).build()
+                            )
+                            .build()
                         )
-                        .build()
-                    )
-                    react_req = (
-                        CreateMessageReactionRequest.builder()
-                        .message_id(reply_to)
-                        .request_body(react_body)
-                        .build()
-                    )
-                    react_resp = await asyncio.to_thread(
-                        self._client.im.v1.message_reaction.create, react_req,
-                    )
-                    if react_resp and react_resp.code == 0:
-                        typing_reaction_id = getattr(react_resp.data, "reaction_id", None)
-                        logger.debug("[Feishu] Added Typing reaction to %s → %s",
-                                     reply_to, typing_reaction_id)
-                except Exception as react_exc:
-                    logger.debug("[Feishu] Failed to add Typing reaction: %s", react_exc)
+                        react_req = (
+                            CreateMessageReactionRequest.builder()
+                            .message_id(reply_to)
+                            .request_body(react_body)
+                            .build()
+                        )
+                        react_resp = await asyncio.to_thread(
+                            self._client.im.v1.message_reaction.create, react_req,
+                        )
+                        if react_resp and react_resp.code == 0:
+                            typing_reaction_id = getattr(react_resp.data, "reaction_id", None)
+                            logger.debug("[Feishu] Added Typing reaction to %s → %s",
+                                         reply_to, typing_reaction_id)
+                    except Exception as react_exc:
+                        logger.debug("[Feishu] Failed to add Typing reaction: %s", react_exc)
 
             # 4. Track the streaming card state
             sc = _FeishuStreamingCard(
@@ -2465,18 +2478,78 @@ class FeishuAdapter(BasePlatformAdapter):
                 .build()
             )
             response = await asyncio.to_thread(self._client.im.v1.message_reaction.create, request)
-            if response and getattr(response, "success", lambda: False)():
+            if response and response.code == 0:
                 data = getattr(response, "data", None)
-                return getattr(data, "reaction_id", None)
-            logger.warning(
+                reaction_id = getattr(data, "reaction_id", None)
+                logger.debug("[Feishu] ACK reaction added to %s → %s", message_id, reaction_id)
+                return reaction_id
+            logger.debug(
                 "[Feishu] Failed to add ack reaction to %s: code=%s msg=%s",
                 message_id,
                 getattr(response, "code", None),
                 getattr(response, "msg", None),
             )
         except Exception:
-            logger.warning("[Feishu] Failed to add ack reaction to %s", message_id, exc_info=True)
+            logger.debug("[Feishu] Failed to add ack reaction to %s", message_id, exc_info=True)
         return None
+
+    # =========================================================================
+    # Early typing reaction — overrides from BasePlatformAdapter
+    # =========================================================================
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        """Add a Typing reaction to the inbound message immediately on receipt.
+
+        This gives the user instant visual feedback instead of waiting for
+        the LLM's TTFT (Time To First Token) which can be 10–30 seconds.
+        The reaction_id is stored in ``_early_typing_reactions`` and either:
+        - Handed off to the streaming card (which will clean it up on stop), or
+        - Cleaned up in ``on_processing_complete`` if no streaming card is used.
+        """
+        message_id = getattr(event, "message_id", None)
+        if not message_id:
+            return
+        reaction_id = await self._add_ack_reaction(message_id)
+        if reaction_id:
+            self._early_typing_reactions[message_id] = reaction_id
+            logger.debug("[Feishu] Early typing reaction added to %s → %s", message_id, reaction_id)
+
+    async def on_processing_complete(self, event: MessageEvent, outcome: Any) -> None:
+        """Clean up any early typing reaction that wasn't claimed by a streaming card.
+
+        When the streaming card path succeeds, it takes ownership of the reaction
+        and removes it in ``stop_streaming_card``.  But if processing fails before
+        a streaming card is created (e.g. auth error, API failure), we need to
+        remove the early reaction here so it doesn't linger.
+        """
+        message_id = getattr(event, "message_id", None)
+        if not message_id:
+            return
+        reaction_id = self._early_typing_reactions.pop(message_id, None)
+        if not reaction_id:
+            return
+        # The streaming card may have claimed it — check if there's an active card
+        # whose reply_to matches this message.  If so, the card owns the cleanup.
+        for sc in self._streaming_cards.values():
+            if sc.reply_to_message_id == message_id and sc.typing_reaction_id == reaction_id:
+                # Belongs to an active streaming card — put it back
+                self._early_typing_reactions[message_id] = reaction_id
+                return
+        # No streaming card claimed it — remove the orphan reaction
+        try:
+            from lark_oapi.api.im.v1 import DeleteMessageReactionRequest
+            del_req = (
+                DeleteMessageReactionRequest.builder()
+                .message_id(message_id)
+                .reaction_id(reaction_id)
+                .build()
+            )
+            await asyncio.to_thread(
+                self._client.im.v1.message_reaction.delete, del_req,
+            )
+            logger.debug("[Feishu] Cleaned up early typing reaction on %s", message_id)
+        except Exception:
+            logger.debug("[Feishu] Failed to clean up early typing reaction on %s", message_id, exc_info=True)
 
     async def _get_message_reactions(self, message_id: str) -> Optional[List[Any]]:
         """List all reactions on a message, for looking up a reaction_id by emoji_type."""
