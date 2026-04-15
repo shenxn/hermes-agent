@@ -2193,3 +2193,46 @@ def _stop_mcp_loop():
         # After closing the loop, any stdio subprocesses that survived the
         # graceful shutdown are now orphaned.  Force-kill them.
         _kill_orphaned_mcp_children()
+
+
+# ---------------------------------------------------------------------------
+# Public API — call an MCP tool programmatically from other modules
+# ---------------------------------------------------------------------------
+
+def call_mcp_tool(server_name: str, tool_name: str, args: dict,
+                  timeout: float = 120.0) -> str:
+    """Call an MCP tool by server name and tool name.
+
+    Returns the raw JSON string result (same format as MCP handler output).
+    Raises RuntimeError if the server is not connected or MCP loop is down.
+
+    This is the stable public interface for cross-module MCP invocation.
+    """
+    with _lock:
+        server = _servers.get(server_name)
+    if not server or not server.session:
+        raise RuntimeError(f"MCP server '{server_name}' is not connected")
+
+    async def _call():
+        result = await server.session.call_tool(tool_name, arguments=args)
+        if result.isError:
+            error_text = ""
+            for block in (result.content or []):
+                if hasattr(block, "text"):
+                    error_text += block.text
+            raise RuntimeError(error_text or "MCP tool returned an error")
+
+        parts: List[str] = []
+        for block in (result.content or []):
+            if hasattr(block, "text"):
+                parts.append(block.text)
+        return "\n".join(parts) if parts else ""
+
+    return _run_on_mcp_loop(_call(), timeout=timeout)
+
+
+def is_mcp_server_connected(server_name: str) -> bool:
+    """Check whether an MCP server is currently connected."""
+    with _lock:
+        server = _servers.get(server_name)
+    return server is not None and server.session is not None

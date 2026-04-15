@@ -776,6 +776,45 @@ VISION_ANALYZE_SCHEMA = {
 }
 
 
+# MCP server name that provides vision tools (configured in config.yaml).
+_MCP_VISION_SERVER = "zai-vision"
+# Original (unprefixed) tool name on the MCP server.
+_MCP_VISION_TOOL = "analyze_image"
+
+
+def _try_mcp_vision(image_source: str, prompt: str) -> Optional[str]:
+    """Attempt to delegate vision analysis to the MCP zai-vision server.
+
+    Returns the analysis text on success, or None if MCP is unavailable.
+    """
+    try:
+        from tools.mcp_tool import call_mcp_tool, is_mcp_server_connected
+    except ImportError:
+        return None
+
+    if not is_mcp_server_connected(_MCP_VISION_SERVER):
+        logger.debug("MCP vision server '%s' not connected, using built-in", _MCP_VISION_SERVER)
+        return None
+
+    try:
+        raw = call_mcp_tool(
+            _MCP_VISION_SERVER,
+            _MCP_VISION_TOOL,
+            args={"image_source": image_source, "prompt": prompt},
+            timeout=120.0,
+        )
+        # call_mcp_tool returns text content directly (not JSON-wrapped).
+        if raw and not raw.startswith('{"error"'):
+            logger.info("Vision analysis delegated to MCP server '%s'", _MCP_VISION_SERVER)
+            return raw
+        # If it looks like a JSON error, log and fall back.
+        if raw:
+            logger.debug("MCP vision returned error-like result, falling back: %s", raw[:200])
+    except Exception as exc:
+        logger.debug("MCP vision call failed, falling back to built-in: %s", exc)
+    return None
+
+
 def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
     image_url = args.get("image_url", "")
     question = args.get("question", "")
@@ -783,6 +822,17 @@ def _handle_vision_analyze(args: Dict[str, Any], **kw: Any) -> Awaitable[str]:
         "Fully describe and explain everything about this image, then answer the "
         f"following question:\n\n{question}"
     )
+
+    # Try MCP vision server first (typically cheaper / better specialized).
+    mcp_result = _try_mcp_vision(image_url, full_prompt)
+    if mcp_result is not None:
+
+        async def _mcp_done():
+            return json.dumps({"success": True, "analysis": mcp_result}, ensure_ascii=False)
+
+        return _mcp_done()
+
+    # Fallback to built-in auxiliary LLM path.
     model = os.getenv("AUXILIARY_VISION_MODEL", "").strip() or None
     return vision_analyze_tool(image_url, full_prompt, model)
 
