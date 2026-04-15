@@ -384,11 +384,12 @@ class TestBackendSelection:
             assert _get_backend() == "exa"
 
     def test_fallback_parallel_takes_priority_over_exa(self):
-        """Exa should only win the fallback path when it is the only configured backend."""
+        """Exa should win over Parallel in the auto-detect order (exa comes before parallel)."""
         from tools.web_tools import _get_backend
         with patch("tools.web_tools._load_web_config", return_value={}), \
              patch.dict(os.environ, {"EXA_API_KEY": "exa-test", "PARALLEL_API_KEY": "par-test"}):
-            assert _get_backend() == "parallel"
+            # exa comes before parallel in _ALL_BACKENDS order
+            assert _get_backend() == "exa"
 
     def test_fallback_tavily_only_key(self):
         """Only TAVILY_API_KEY set → 'tavily'."""
@@ -404,13 +405,13 @@ class TestBackendSelection:
              patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test", "FIRECRAWL_API_KEY": "fc-test"}):
             assert _get_backend() == "firecrawl"
 
-    def test_fallback_tavily_with_parallel_prefers_parallel(self):
-        """Tavily + Parallel keys, no config → 'parallel' (Parallel takes priority over Tavily)."""
+    def test_fallback_tavily_with_parallel_prefers_tavily(self):
+        """Tavily + Parallel keys, no config → 'tavily' (tavily comes before parallel in _ALL_BACKENDS)."""
         from tools.web_tools import _get_backend
         with patch("tools.web_tools._load_web_config", return_value={}), \
              patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-test", "PARALLEL_API_KEY": "par-test"}):
-            # Parallel + no Firecrawl → parallel
-            assert _get_backend() == "parallel"
+            # tavily comes before parallel in _ALL_BACKENDS order
+            assert _get_backend() == "tavily"
 
     def test_fallback_both_keys_defaults_to_firecrawl(self):
         """Both keys set, no config → 'firecrawl' (backward compat)."""
@@ -500,17 +501,17 @@ class TestWebSearchErrorHandling:
         firecrawl_client = MagicMock()
         firecrawl_client.search.side_effect = RuntimeError("boom")
 
-        with patch("tools.web_tools._get_backend", return_value="firecrawl"), \
+        with patch("tools.web_tools._get_backend_chain", return_value=["firecrawl"]), \
              patch("tools.web_tools._get_firecrawl_client", return_value=firecrawl_client), \
              patch("tools.interrupt.is_interrupted", return_value=False), \
              patch.object(tools.web_tools._debug, "log_call") as mock_log_call, \
              patch.object(tools.web_tools._debug, "save"):
             result = json.loads(tools.web_tools.web_search_tool("test query", limit=3))
 
-        assert result == {"error": "Error searching web: boom"}
+        assert result == {"error": "Error searching web: All search backends failed: boom"}
 
         debug_payload = mock_log_call.call_args.args[1]
-        assert debug_payload["error"] == "Error searching web: boom"
+        assert "All search backends failed" in debug_payload["error"]
         assert "traceback" not in debug_payload["error"]
         assert "exception_type" not in debug_payload["error"]
         assert "config" not in result
