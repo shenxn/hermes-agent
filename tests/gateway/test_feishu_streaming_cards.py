@@ -43,7 +43,7 @@ class TestBuildStreamingCardJson(unittest.TestCase):
 
         card = FeishuAdapter._build_streaming_card_json("hello")
         elements = card["body"]["elements"]
-        assert len(elements) == 1
+        assert len(elements) == 2  # text element + loading indicator
         assert elements[0]["tag"] == "markdown"
         assert elements[0]["content"] == "hello"
         assert elements[0]["element_id"] == _STREAMING_CARD_ELEMENT_ID
@@ -81,6 +81,10 @@ class TestSendStreamingCard(unittest.TestCase):
 
             def settings(self, request):
                 captured["cardkit_settings"] = request
+                return SimpleNamespace(code=0, msg="success")
+
+            def update(self, request):
+                captured["cardkit_update"] = request
                 return SimpleNamespace(code=0, msg="success")
 
         class _CardElementAPI:
@@ -326,7 +330,7 @@ class TestStreamConsumerFeishuIntegration:
         adapter.send_streaming_card.assert_called()
         adapter.send.assert_not_called()
         # Should have called stop_streaming_card at the end
-        adapter.stop_streaming_card.assert_called_once_with("om_stream")
+        adapter.stop_streaming_card.assert_called_once_with("om_stream", status="completed")
 
     @pytest.mark.asyncio
     async def test_consumer_does_not_add_cursor_for_streaming_cards(self):

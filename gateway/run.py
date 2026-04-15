@@ -8189,7 +8189,8 @@ class GatewayRunner:
 
             # Signal the stream consumer that the agent is done
             if _stream_consumer is not None:
-                _stream_consumer.finish()
+                _was_interrupted = result.get("interrupted") or not result.get("completed", True)
+                _stream_consumer.finish(terminated=bool(_was_interrupted))
             
             # Return final response, or a message if something went wrong
             final_response = result.get("final_response")

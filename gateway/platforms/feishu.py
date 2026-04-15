@@ -1678,12 +1678,18 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.error("[Feishu] _update_streaming_card_content error: %s", exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
-    async def stop_streaming_card(self, message_id: str) -> bool:
+    async def stop_streaming_card(self, message_id: str, *, status: str = "completed") -> bool:
         """Disable streaming mode on a card and clean up tracking state.
 
         Replaces the entire card body with one that contains only the text
-        element (no loading indicator). This mirrors the OpenClaw plugin's
+        element (no loading indicator).  This mirrors the OpenClaw plugin's
         closeStreamingAndUpdate → updateCardKitCard flow.
+
+        *status* controls the footer text shown on the card:
+
+        - ``"completed"`` — normal completion (✅ 已完成)
+        - ``"terminated"`` — cancelled or errored out (⏹ 已终止)
+        - ``"continued"`` — split/overflow, a new card follows (⏸ 待续 →)
 
         Returns *True* on success.  Safe to call even if the message is not a
         streaming card (returns *True* immediately).
@@ -1716,13 +1722,16 @@ class FeishuAdapter(BasePlatformAdapter):
             )
 
             # Step 2: replace entire card body (removes loading indicator)
-            # Build a final card with text + footer (completed status + elapsed time)
+            # Build a final card with text + footer (status + elapsed time)
             elapsed_ms = (time.time() - sc.created_at) * 1000
             elapsed_sec = elapsed_ms / 1000
             elapsed_str = f"{elapsed_sec:.1f}s" if elapsed_sec < 60 else f"{int(elapsed_sec // 60)}m {int(elapsed_sec % 60)}s"
-            footer_content = (
-                f"✅ 已完成 · 耗时 {elapsed_str}"
-            )
+            _STATUS_FOOTERS = {
+                "completed": f"✅ 已完成 · 耗时 {elapsed_str}",
+                "terminated": f"⏹ 已终止 · 耗时 {elapsed_str}",
+                "continued": f"⏸ 待续 → · 耗时 {elapsed_str}",
+            }
+            footer_content = _STATUS_FOOTERS.get(status, _STATUS_FOOTERS["completed"])
 
             final_elements = [
                 {

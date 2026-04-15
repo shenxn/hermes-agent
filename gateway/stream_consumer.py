@@ -98,6 +98,7 @@ class GatewayStreamConsumer:
         # Feishu CardKit streaming card support
         self._uses_streaming_card = getattr(adapter, "streaming_cards_enabled", False) is True
         self._has_new_content = False   # Set True on new deltas, cleared after successful edit
+        self._terminated = False        # Set True by finish(terminated=True) for /stop interrupts
 
     @property
     def already_sent(self) -> bool:
@@ -152,8 +153,14 @@ class GatewayStreamConsumer:
         elif text is None:
             self.on_segment_break()
 
-    def finish(self) -> None:
-        """Signal that the stream is complete."""
+    def finish(self, *, terminated: bool = False) -> None:
+        """Signal that the stream is complete.
+
+        When *terminated* is True the stream was interrupted (e.g. /stop)
+        rather than finishing naturally — the final card footer will show
+        "已终止" instead of "已完成".
+        """
+        self._terminated = terminated
         self._queue.put(_DONE)
 
     async def run(self) -> None:
@@ -276,7 +283,7 @@ class GatewayStreamConsumer:
                             break
                         self._accumulated = self._accumulated[split_at:].lstrip("\n")
                         # Stop the current streaming card before starting a new one
-                        await self._stop_streaming_card_if_active()
+                        await self._stop_streaming_card_if_active(status="continued")
                         self._message_id = None
                         self._last_sent_text = ""
 
@@ -303,7 +310,8 @@ class GatewayStreamConsumer:
                             self._final_response_sent = await self._send_or_edit(self._accumulated)
                             await self._send_or_edit(self._accumulated)
                     # Finalize any active streaming card
-                    await self._stop_streaming_card_if_active()
+                    _done_status = "terminated" if self._terminated else "completed"
+                    await self._stop_streaming_card_if_active(status=_done_status)
                     return
 
                 if commentary_text is not None:
@@ -353,13 +361,13 @@ class GatewayStreamConsumer:
                 except Exception:
                     pass
             try:
-                await self._stop_streaming_card_if_active()
+                await self._stop_streaming_card_if_active(status="terminated")
             except Exception:
                 pass
         except Exception as e:
             logger.error("Stream consumer error: %s", e)
             try:
-                await self._stop_streaming_card_if_active()
+                await self._stop_streaming_card_if_active(status="terminated")
             except Exception:
                 pass
 
@@ -662,7 +670,7 @@ class GatewayStreamConsumer:
                             # so Feishu cleans up server-side state before we
                             # attempt to create a new card.  Without this, the
                             # new send_streaming_card() gets 300309 forever.
-                            await self._stop_streaming_card_if_active()
+                            await self._stop_streaming_card_if_active(status="continued")
                             self._message_id = None
                             self._already_sent = False
                             self._last_sent_text = ""
@@ -745,9 +753,17 @@ class GatewayStreamConsumer:
             logger.error("Stream send/edit error: %s", e)
             return False
 
-    async def _stop_streaming_card_if_active(self) -> None:
-        """Stop the streaming card if the adapter supports it and one is active."""
+    async def _stop_streaming_card_if_active(self, *, status: str = "completed") -> None:
+        """Stop the streaming card if the adapter supports it and one is active.
+
+        *status* is forwarded to the adapter's ``stop_streaming_card`` and
+        controls the footer text shown on the final card:
+
+        - ``"completed"`` — normal completion (✅ 已完成)
+        - ``"terminated"`` — cancelled or errored out (⏹ 已终止)
+        - ``"continued"`` — split/overflow, a new card follows (⏸ 待续 →)
+        """
         if self._uses_streaming_card and self._message_id is not None:
             stop_fn = getattr(self.adapter, "stop_streaming_card", None)
             if stop_fn is not None:
-                await stop_fn(self._message_id)
+                await stop_fn(self._message_id, status=status)
