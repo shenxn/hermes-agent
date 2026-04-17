@@ -370,7 +370,13 @@ async def _zai_reader_extract(urls: List[str], return_format: str = "markdown") 
                 try:
                     page_data = json.loads(text_content)
                 except (json.JSONDecodeError, TypeError):
-                    # If not JSON, treat as raw content
+                    # Check for MCP protocol errors disguised as raw text
+                    if text_content.startswith("MCP error"):
+                        logger.warning("zai-reader returned MCP error for %s: %s", url, text_content[:200])
+                        results.append({"url": url, "title": "", "content": "", "raw_content": "",
+                                        "error": f"zai-reader: {text_content}"})
+                        continue
+                    # Otherwise treat as raw content
                     results.append({"url": url, "title": "", "content": text_content,
                                     "raw_content": text_content, "metadata": {}})
                     continue
