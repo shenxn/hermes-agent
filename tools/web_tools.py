@@ -69,8 +69,8 @@ logger = logging.getLogger(__name__)
 # ─── Backend Registry & Fallback Framework ────────────────────────────────────
 
 _BACKEND_CAPABILITIES: Dict[str, Dict[str, bool]] = {
-    "zai-reader": {"extract": True,  "search": False, "crawl": False},
     "firecrawl":  {"extract": True,  "search": True,  "crawl": True},
+    "zai-reader": {"extract": True,  "search": False, "crawl": False},
     "tavily":     {"extract": True,  "search": True,  "crawl": True},
     "exa":        {"extract": True,  "search": True,  "crawl": False},
     "parallel":   {"extract": True,  "search": True,  "crawl": False},
