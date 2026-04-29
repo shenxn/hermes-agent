@@ -1,0 +1,157 @@
+<!DOCTYPE html><html lang="zh"><head><meta charset="UTF-8"><meta name="viewport" content="width=480, initial-scale=1.0">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;600;700&display=swap');
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Noto Sans SC',sans-serif;background:#FAF9F7;color:#222;padding:8px;max-width:480px;margin:0 auto;font-size:11px}
+.hdr{background:linear-gradient(135deg,#2C3E50,#34495E);color:#fff;border-radius:10px;padding:10px;margin-bottom:8px;text-align:center}
+.hdr h1{font-size:15px;font-weight:900}
+.hdr .sub{font-size:10px;opacity:.85;margin-top:2px}
+#map{height:360px;border-radius:10px;margin-bottom:8px;border:2px solid #ddd}
+.legend{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px;font-size:9px}
+.legend-item{display:flex;align-items:center;gap:3px;background:#fff;border-radius:4px;padding:2px 6px;border:1px solid #eee}
+.legend-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
+.cards{display:flex;flex-direction:column;gap:6px}
+.card{background:#fff;border-radius:8px;padding:8px 10px;border-left:4px solid #ddd;font-size:10px}
+.card-title{font-weight:700;font-size:11px;margin-bottom:2px}
+.card-detail{color:#666;font-size:9px}
+.card-walk{color:#27AE60;font-weight:600;font-size:9px}
+.card-time{color:#888;font-size:9px;font-family:Inter,monospace}
+.footer{text-align:center;font-size:9px;color:#aaa;margin-top:8px}
+.slot{background:#FEF9E7;border:1px solid #F9E79F;border-radius:8px;padding:6px 10px;margin-bottom:8px;font-size:10px}
+.slot .st{font-weight:700;color:#B7950B;font-size:11px}
+</style></head><body>
+<div class="hdr">
+<h1>🗺️ 全州电影节 · 景点地图</h1>
+<div class="sub">JIFF 2026 · 影院+景点+美食 · 全部步行可达</div>
+</div>
+<div id="map"></div>
+<script>
+var map = L.map('map',{zoomControl:false}).setView([35.818, 127.150], 16);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{
+  attribution:'© OSM',maxZoom:19
+}).addTo(map);
+
+// 自定义图标
+function makeIcon(color, emoji, size){
+  return L.divIcon({
+    className:'',
+    html:'<div style="background:'+color+';width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:14px;box-shadow:0 2px 6px rgba(0,0,0,.3);border:2px solid #fff">'+emoji+'</div>',
+    iconSize:[28,28],iconAnchor:[14,14]
+  });
+}
+
+// 影院
+var cinemaIcon = makeIcon('#E74C3C','🎬');
+var spotIcon = makeIcon('#3498DB','🏛️');
+var foodIcon = makeIcon('#F39C12','🍜');
+var trainIcon = makeIcon('#8E44AD','🚉');
+
+// CGV
+L.marker([35.8195,127.1475],{icon:cinemaIcon}).addTo(map)
+  .bindPopup('<b>CGV 全州高士</b><br>전주객사3길 72<br>8厅 1271席<br>⚡ 电影节主场馆');
+
+// Megabox
+L.marker([35.8188,127.1468],{icon:cinemaIcon}).addTo(map)
+  .bindPopup('<b>Megabox 全州客舍</b><br>전주객사4길 74-12<br>⚡ 电影节场馆');
+
+// 独立影院
+L.marker([35.8215,127.1485],{icon:cinemaIcon}).addTo(map)
+  .bindPopup('<b>全州数码独立影院</b><br>독립영화관<br>独立/实验电影专用');
+
+// 韩屋村
+L.marker([35.8155,127.1530],{icon:spotIcon}).addTo(map)
+  .bindPopup('<b>🏘️ 全州韩屋村</b><br>700+栋韩屋 韩国最大<br>⏰ 1-2h · 🚶 影院步行10-15min');
+
+// 殿洞圣殿
+L.marker([35.8150,127.1520],{icon:spotIcon}).addTo(map)
+  .bindPopup('<b>⛪ 殿洞圣殿</b><br>전동성당<br>韩屋村内的西洋教堂 拍照圣地');
+
+// 丰南门
+L.marker([35.8165,127.1510],{icon:spotIcon}).addTo(map)
+  .bindPopup('<b>🏯 丰南门</b><br>풍남문<br>全州古城南门 韩屋村入口');
+
+// 南部市场
+L.marker([35.8135,127.1500],{icon:foodIcon}).addTo(map)
+  .bindPopup('<b>🛒 南部市场 + 青年몰</b><br>남부시장<br>传统市场+夜市+青年美食街');
+
+// 壁画村
+L.marker([35.8175,127.1555],{icon:spotIcon}).addTo(map)
+  .bindPopup('<b>🎨 紫满壁画村</b><br>자만벽화마을<br>小巷壁画+网红咖啡馆');
+
+// 客里团街
+L.marker([35.8192,127.1495],{icon:foodIcon}).addTo(map)
+  .bindPopup('<b>📸 客里团街 객리단길</b><br>影院旁边！咖啡馆+餐厅+文创<br>电影节期间特别热闹');
+
+// 梧木台
+L.marker([35.8140,127.1550],{icon:spotIcon}).addTo(map)
+  .bindPopup('<b>🌿 梧木台 오목대</b><br>小山观景台 俯瞰全城<br>🌅 日落时分最美');
+
+// 三星文化会馆
+L.marker([35.8460,127.1300],{icon:cinemaIcon}).addTo(map)
+  .bindPopup('<b>三星文化会馆</b><br>삼성문화회관<br>全北大学内 (需公交)');
+
+// 全州站
+L.marker([35.8370,127.1180],{icon:trainIcon}).addTo(map)
+  .bindPopup('<b>🚉 全州站 전주역</b><br>KTX/大巴到达<br>→ 影院打车约15min');
+
+// 画步行范围圆
+L.circle([35.819,127.149],{
+  radius:600,color:'#27AE60',fillColor:'#27AE60',fillOpacity:0.05,weight:2,dashArray:'5,5'
+}).addTo(map).bindPopup('🚶 步行10分钟范围');
+
+L.circle([35.819,127.149],{
+  radius:1200,color:'#3498DB',fillColor:'#3498DB',fillOpacity:0.03,weight:1,dashArray:'3,6'
+}).addTo(map).bindPopup('🚶 步行20分钟范围');
+</script>
+<div class="legend">
+<div class="legend-item"><div class="legend-dot" style="background:#E74C3C"></div>🎬 影院</div>
+<div class="legend-item"><div class="legend-dot" style="background:#3498DB"></div>🏛️ 景点</div>
+<div class="legend-item"><div class="legend-dot" style="background:#F39C12"></div>🍜 美食/逛街</div>
+<div class="legend-item"><div class="legend-dot" style="background:#8E44AD"></div>🚉 交通</div>
+<div class="legend-item"><div class="legend-dot" style="background:#27AE60;border:1px dashed #27AE60"></div>步行10min圈</div>
+</div>
+<div class="slot">
+<div class="st">📅 结合排片的游览空档</div>
+<b>5/1 17:19-20:00</b> (2h41min)<br>
+铜(Megabox)结束 → 步行15min到韩屋村 → 逛韩屋+殿洞圣殿 → 吃拌饭 → 步行回Megabox看她们<br><br>
+<b>5/2 11:07-15:30</b> (4h23min) ⭐最佳空档<br>
+加那利(CGV)结束 → 客里团街午餐 → 韩屋村深度逛 → 南部市场 → 壁画村咖啡 → 步行回CGV看复数之身<br><br>
+<b>5/3 12:08-14:00</b> (1h52min)<br>
+白鸟遗林(CGV)结束 → 客里团街午饭 → 逛逛小店 → 回CGV看张明夫
+</div>
+<div class="cards">
+<div class="card" style="border-left-color:#E74C3C">
+<div class="card-title">🎬 CGV全州高士 → Megabox全州客舍</div>
+<div class="card-detail">电影节主战场！两栋楼步行5分钟</div>
+<div class="card-walk">🚶 彼此步行5min</div>
+</div>
+<div class="card" style="border-left-color:#3498DB">
+<div class="card-title">🏘️ 全州韩屋村 한옥마을</div>
+<div class="card-detail">700+栋韩屋 · 韩服体验 · 传统工艺 · 殿洞圣殿</div>
+<div class="card-walk">🚶 影院步行10-15min · 逛1-2h</div>
+</div>
+<div class="card" style="border-left-color:#F39C12">
+<div class="card-title">📸 客里团街 객리단길</div>
+<div class="card-detail">影院旁边！咖啡馆 · 文创店 · 电影节露天活动</div>
+<div class="card-walk">🚶 影院步行1-2min</div>
+</div>
+<div class="card" style="border-left-color:#F39C12">
+<div class="card-title">🛒 南部市场 + 青年몰</div>
+<div class="card-detail">传统市场 · 夜市 · 青年创业美食街</div>
+<div class="card-walk">🚶 影院步行10min · 逛1h</div>
+</div>
+<div class="card" style="border-left-color:#3498DB">
+<div class="card-title">🎨 紫满壁画村 + 🌿 梧木台</div>
+<div class="card-detail">小巷壁画 · 网红咖啡 · 山顶观景台俯瞰全城</div>
+<div class="card-walk">🚶 影院步行15-20min</div>
+</div>
+<div class="card" style="border-left-color:#F39C12">
+<div class="card-title">🍜 必吃：全州拌饭 + 豆芽汤饭</div>
+<div class="card-detail">한국집(韩国家) · 고궁수라간(古宫) · 현대옥(现代屋)</div>
+<div class="card-time">都在韩屋村内，逛的时候顺便吃</div>
+</div>
+</div>
+<div class="footer">JIFF 2026 · 龙虾人🦞 · 4/29</div>
+</body></html>
