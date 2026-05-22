@@ -40,6 +40,11 @@ _DONE = object()
 # new one so that subsequent text appears below tool progress messages.
 _NEW_SEGMENT = object()
 
+# Sentinel for injecting tool progress text inline into the streamed response.
+# When merge_segments is True, tool output is queued as _INJECT entries and
+# rendered as blockquotes within the same streaming message.
+_INJECT = object()
+
 # Queue marker for a completed assistant commentary message emitted between
 # API/tool iterations (for example: "I'll inspect the repo first.").
 _COMMENTARY = object()
@@ -72,6 +77,12 @@ class StreamConsumerConfig:
     # "group", "supergroup", "forum").  Used to gate native draft streaming,
     # which is platform-specific (Telegram drafts are DM-only).
     chat_type: str = ""
+    # Merge tool progress segments into the streaming message as blockquotes
+    # instead of sending them as separate messages.  When True, tool output
+    # is injected inline into the streamed response via _INJECT sentinel.
+    merge_segments: bool = True
+    # CardKit streaming mode — "cardkit" enables Feishu CardKit API path.
+    streaming_mode: str = ""
 
 
 class GatewayStreamConsumer:
@@ -181,6 +192,12 @@ class GatewayStreamConsumer:
         # this response and route through edit-based for graceful degradation.
         self._draft_failures = 0
 
+        # CardKit streaming card state
+        self._uses_streaming_card = (
+            getattr(self.cfg, "streaming_mode", "") == "cardkit"
+            and getattr(adapter, "streaming_cards_enabled", False)
+        )
+
     @property
     def already_sent(self) -> bool:
         """True if at least one message was sent or edited during the run."""
@@ -251,6 +268,15 @@ class GatewayStreamConsumer:
     def finish(self) -> None:
         """Signal that the stream is complete."""
         self._queue.put(_DONE)
+
+    def inject(self, text: str) -> None:
+        """Thread-safe — inject tool-progress text inline into the stream.
+
+        When merge_segments is True, tool output is rendered as a blockquote
+        within the same streaming message via the _INJECT sentinel.
+        """
+        if self.cfg.merge_segments and text:
+            self._queue.put((_INJECT, text))
 
     # ── Think-block filtering ────────────────────────────────────────
     # Models like MiniMax emit inline <think>...</think> blocks in their
@@ -405,6 +431,12 @@ class GatewayStreamConsumer:
                         if isinstance(item, tuple) and len(item) == 2 and item[0] is _COMMENTARY:
                             commentary_text = item[1]
                             break
+                        if isinstance(item, tuple) and len(item) == 2 and item[0] is _INJECT:
+                            # Tool-progress injection: format as blockquote and append
+                            inject_text = item[1].strip()
+                            if inject_text and self._accumulated:
+                                self._accumulated += "\n\n> " + inject_text.replace("\n", "\n> ") + "\n\n"
+                            break
                         self._filter_and_accumulate(item)
                     except queue.Empty:
                         break
@@ -547,6 +579,11 @@ class GatewayStreamConsumer:
                             )
                         elif not self._already_sent:
                             self._final_response_sent = await self._send_or_edit(self._accumulated)
+
+                    # Stop streaming card if one was created
+                    if self._uses_streaming_card and self._message_id:
+                        await self._stop_streaming_card_if_active()
+
                     return
 
                 if commentary_text is not None:
@@ -1247,12 +1284,21 @@ class GatewayStreamConsumer:
             else:
                 # First message — send new, threaded to the original user message
                 # so it lands in the correct topic/thread.
-                result = await self.adapter.send(
-                    chat_id=self.chat_id,
-                    content=text,
-                    reply_to=self._initial_reply_to_id,
-                    metadata=self.metadata,
-                )
+                if self._uses_streaming_card:
+                    # CardKit path: create a streaming card instead of a regular message
+                    result = await self.adapter.send_streaming_card(
+                        chat_id=self.chat_id,
+                        content=text,
+                        reply_to=self._initial_reply_to_id,
+                        metadata=self.metadata,
+                    )
+                else:
+                    result = await self.adapter.send(
+                        chat_id=self.chat_id,
+                        content=text,
+                        reply_to=self._initial_reply_to_id,
+                        metadata=self.metadata,
+                    )
                 if result.success:
                     if result.message_id:
                         self._message_id = result.message_id
@@ -1284,3 +1330,14 @@ class GatewayStreamConsumer:
         except Exception as e:
             logger.error("Stream send/edit error: %s", e)
             return False
+
+    async def _stop_streaming_card_if_active(self) -> None:
+        """Stop the streaming card if one was created during this run."""
+        mid = self._message_id
+        if mid and mid != "__no_edit__":
+            try:
+                stop_fn = getattr(self.adapter, "stop_streaming_card", None)
+                if stop_fn:
+                    await stop_fn(mid, status="completed")
+            except Exception as exc:
+                logger.debug("Failed to stop streaming card: %s", exc)

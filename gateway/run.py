@@ -14365,6 +14365,12 @@ class GatewayRunner:
                         fresh_final_after_seconds=_fresh_final_secs,
                         transport=_scfg.transport or "auto",
                         chat_type=getattr(source, "chat_type", "") or "",
+                        merge_segments=getattr(_scfg, "merge_segments", True),
+                        streaming_mode=(
+                            getattr(_scfg, "streaming_mode", "")
+                            if source.platform == Platform.FEISHU
+                            else ""
+                        ),
                     )
                     _stream_consumer = GatewayStreamConsumer(
                         adapter=_adapter,
@@ -15045,6 +15051,13 @@ class GatewayRunner:
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
                 return
+            # Inject tool-progress into streaming message when merge_segments is on
+            if event_type == "tool_progress" and _stream_consumer is not None:
+                try:
+                    _stream_consumer.inject(message)
+                except Exception:
+                    pass
+                return
             _fut = safe_schedule_threadsafe(
                 _status_adapter.send(
                     _status_chat_id,
@@ -15188,6 +15201,12 @@ class GatewayRunner:
                             fresh_final_after_seconds=_fresh_final_secs,
                             transport=_scfg.transport or "auto",
                             chat_type=getattr(source, "chat_type", "") or "",
+                            merge_segments=getattr(_scfg, "merge_segments", True),
+                            streaming_mode=(
+                                getattr(_scfg, "streaming_mode", "")
+                                if source.platform == Platform.FEISHU
+                                else ""
+                            ),
                         )
                         _stream_consumer = GatewayStreamConsumer(
                             adapter=_adapter,

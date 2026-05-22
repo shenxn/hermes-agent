@@ -1,0 +1,254 @@
+================================================================================
+INSERTION POINTS FOR CARDKIT STREAMING CONFIG AND TOOL-PROGRESS CALLBACK
+File: gateway/run.py (17073 lines)
+================================================================================
+
+There are TWO code paths that construct StreamConsumerConfig + GatewayStreamConsumer:
+  - Site A (lines ~14319-14382): First streaming setup path
+  - Site B (lines ~15130-15210): Second streaming setup path (main async path with
+    progress_queue, stream_consumer_holder, etc.)
+
+Both sites have identical patterns and BOTH need the injection.
+
+--------------------------------------------------------------------------------
+1. WHERE StreamConsumerConfig IS CONSTRUCTED
+--------------------------------------------------------------------------------
+
+SITE A -- Line 14360 (lines 14355-14370):
+                    _fresh_final_secs = (
+                        float(getattr(_scfg, "fresh_final_after_seconds", 0.0) or 0.0)
+                        if source.platform == Platform.TELEGRAM
+                        else 0.0
+                    )
+                    _consumer_cfg = StreamConsumerConfig(            # <<< LINE 14360
+                        edit_interval=_scfg.edit_interval,
+                        buffer_threshold=_scfg.buffer_threshold,
+                        cursor=_effective_cursor,
+                        buffer_only=_buffer_only,
+                        fresh_final_after_seconds=_fresh_final_secs,
+                        transport=_scfg.transport or "auto",
+                        chat_type=getattr(source, "chat_type", "") or "",
+                    )
+                    _stream_consumer = GatewayStreamConsumer(
+
+SITE B -- Line 15183 (lines 15180-15192):
+                        _consumer_cfg = StreamConsumerConfig(        # <<< LINE 15183
+                            edit_interval=_scfg.edit_interval,
+                            buffer_threshold=_scfg.buffer_threshold,
+                            cursor=_effective_cursor,
+                            buffer_only=_buffer_only,
+                            fresh_final_after_seconds=_fresh_final_secs,
+                            transport=_scfg.transport or "auto",
+                            chat_type=getattr(source, "chat_type", "") or "",
+                        )
+                        _stream_consumer = GatewayStreamConsumer(
+
+>>> INJECTION: Add two fields to both StreamConsumerConfig(...) calls:
+    merge_segments=True,
+    streaming_mode=(_scfg.streaming_mode if source.platform == Platform.FEISHU else ""),
+
+  NOTE: StreamConsumerConfig already has merge_segments: bool = True and
+  streaming_mode: str = "" as defaults (stream_consumer.py lines 83-85), so
+  omitting them means defaults kick in. You MUST explicitly pass streaming_mode
+  when platform is Feishu to enable cardkit mode.
+
+--------------------------------------------------------------------------------
+2. WHERE GatewayStreamConsumer IS CONSTRUCTED
+--------------------------------------------------------------------------------
+
+SITE A -- Line 14369 (lines 14369-14376):
+                    _stream_consumer = GatewayStreamConsumer(        # <<< LINE 14369
+                        adapter=_adapter,
+                        chat_id=source.chat_id,
+                        config=_consumer_cfg,
+                        metadata=_thread_metadata,
+                        initial_reply_to_id=event_message_id,
+                    )
+
+SITE B -- Line 15192 (lines 15192-15202):
+                        _stream_consumer = GatewayStreamConsumer(    # <<< LINE 15192
+                            adapter=_adapter,
+                            chat_id=source.chat_id,
+                            config=_consumer_cfg,
+                            metadata=_status_thread_metadata,
+                            on_new_message=(
+                                (lambda: progress_queue.put(("__reset__",)))
+                                if progress_queue is not None
+                                else None
+                            ),
+                            initial_reply_to_id=event_message_id,
+                        )
+
+>>> The consumer already receives config=_consumer_cfg, so if you add the fields
+  to StreamConsumerConfig in point 1, they flow through automatically. No change
+  needed here unless you also need to pass extra adapter args.
+
+--------------------------------------------------------------------------------
+3. WHERE _status_callback_sync IS DEFINED (tool-progress inject target)
+--------------------------------------------------------------------------------
+
+Line 15045 (lines 15045-15074):
+        def _status_callback_sync(event_type: str, message: str) -> None:
+            if not _status_adapter or not _run_still_current():
+                return
+            _fut = safe_schedule_threadsafe(
+                _status_adapter.send(
+                    _status_chat_id,
+                    message,
+                    metadata=_status_thread_metadata,
+                ),
+                _loop_for_step,
+                logger=logger,
+                log_message=f"status_callback ({event_type}) scheduling error",
+            )
+            if _fut is None:
+                return
+            if _cleanup_progress:
+                def _track_status_id(fut) -> None:
+                    try:
+                        res = fut.result()
+                    except Exception:
+                        return
+                    mid = getattr(res, "message_id", None)
+                    if getattr(res, "success", False) and mid:
+                        _cleanup_msg_ids.append(str(mid))
+                _fut.add_done_callback(_track_status_id)
+
+>>> INJECTION: To add tool-progress inline injection, add after the early-return
+  guard (after line 15047, before the safe_schedule_threadsafe call):
+
+    if event_type == "tool_progress" and _stream_consumer is not None:
+        _stream_consumer.inject(message)
+        return
+
+  This routes tool-progress events into the stream consumer merged message
+  instead of sending them as separate status messages. The consumer.inject()
+  method (stream_consumer.py line 272) is thread-safe and queues _INJECT
+  sentinels that get rendered as blockquotes when merge_segments=True.
+
+  Note: In Site A there is a separate _status_callback_sync (different scope),
+  but Site B (line 15045) is the one used in the main async message handler.
+
+--------------------------------------------------------------------------------
+4. WHERE stream_delta_callback IS WIRED TO THE AGENT
+--------------------------------------------------------------------------------
+
+Line 15307 (lines 15300-15315):
+            # Per-message state -- callbacks and reasoning config change every
+            # turn and must not be baked into the cached agent constructor.
+            agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
+            agent.stepCallback = _step_callback_sync if _hooks_ref.loaded_hooks else None
+            agent.stream_deltaCallback = _stream_delta_cb            # <<< LINE 15307
+            agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
+            agent.statusCallback = _status_callback_sync
+            agent.reasoning_config = reasoning_config
+            agent.service_tier = self._service_tier
+            agent.request_overrides = turn_route.get("request_overrides") or {}
+
+>>> The _stream_delta_cb is defined at Site B line 15204:
+    if _want_stream_deltas:
+        def _stream_delta_cb(text: str) -> None:
+            if _run_still_current():
+                _stream_consumer.on_delta(text)
+
+  No change needed here for CardKit -- the delta callback already feeds into the
+  consumer, which checks its config.streaming_mode internally.
+
+--------------------------------------------------------------------------------
+5. WHERE STREAM CONSUMER IS STARTED AND FINISHED
+--------------------------------------------------------------------------------
+
+STARTED -- Line 15912 (lines 15905-15917):
+        stream_task = None
+
+        async def _start_stream_consumer():
+            Wait for the stream consumer to be created, then run it.
+            for _ in range(200):  # Up to 10s wait
+                if stream_consumer_holder[0] is not None:
+                    await stream_consumer_holder[0].run()
+                    return
+                await asyncio.sleep(0.05)
+
+        stream_task = asyncio.create_task(_start_stream_consumer())   # <<< LINE 15912
+
+FINISH (consumer.finish()) -- Line 15734:
+            # Signal the stream consumer that the agent is done
+            if _stream_consumer is not None:
+                _stream_consumer.finish()                             # <<< LINE 15734
+
+AWAIT (stream_task) -- Line 16333 (inside non-interrupt path):
+                    _sc = stream_consumer_holder[0]
+                    if _sc and stream_task:
+                        try:
+                            await asyncio.wait_for(stream_task, timeout=5.0)  # <<< LINE 16335
+                        except (asyncio.TimeoutError, asyncio.CancelledError):
+                            stream_task.cancel()
+
+AWAIT (stream_task) -- Line 16455 (inside finally block):
+            if stream_task:
+                try:
+                    await asyncio.wait_for(stream_task, timeout=5.0)  # <<< LINE 16457
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    stream_task.cancel()
+
+>>> No changes needed for CardKit at start/finish points -- the consumer handles
+  cardkit lifecycle internally based on its config.streaming_mode.
+
+--------------------------------------------------------------------------------
+6. WHERE STREAMING CONFIG IS RESOLVED (StreamingConfig to StreamConsumerConfig)
+--------------------------------------------------------------------------------
+
+SITE A -- Lines 14321-14324:
+        _stream_consumer = None
+        _scfg = getattr(getattr(self, "config", None), "streaming", None)
+        if _scfg is None:
+            from gateway.config import StreamingConfig
+            _scfg = StreamingConfig()
+
+SITE B -- Lines 15131-15137:
+            _stream_consumer = None
+            _stream_delta_cb = None
+            _scfg = getattr(getattr(self, 'config', None), 'streaming', None)
+            if _scfg is None:
+                from gateway.config import StreamingConfig
+                _scfg = StreamingConfig()
+
+>>> StreamingConfig (gateway/config.py line 349) has:
+    streaming_mode: str = ""    (line 376)
+
+  It is loaded from config YAML via StreamingConfig.from_dict() (line 392),
+  which reads: streaming_mode=data.get("streaming_mode", "") (line 406).
+
+  The full flow:
+    config.yaml streaming.streaming_mode -> StreamingConfig.streaming_mode
+        -> _scfg.streaming_mode -> (YOU INJECT HERE) -> StreamConsumerConfig.streaming_mode
+            -> GatewayStreamConsumer checks getattr(self.cfg, "streaming_mode", "") == "cardkit"
+              (stream_consumer.py line 197)
+
+  >>> INJECTION: The missing link is at StreamConsumerConfig construction (point 1).
+  Currently neither site passes streaming_mode or merge_segments explicitly -- they
+  rely on defaults (merge_segments=True, streaming_mode=""). You need to add:
+
+    streaming_mode=(_scfg.streaming_mode if source.platform == Platform.FEISHU else ""),
+
+  to both StreamConsumerConfig() calls so the value from config.yaml reaches the consumer.
+
+================================================================================
+SUMMARY OF REQUIRED CHANGES
+================================================================================
+
+CHANGE 1 -- StreamConsumerConfig construction (TWO sites):
+  Line 14360 and Line 15183
+  Add to constructor kwargs:
+    merge_segments=True,
+    streaming_mode=(_scfg.streaming_mode if source.platform == Platform.FEISHU else ""),
+
+CHANGE 2 -- _status_callback_sync tool-progress inject (ONE site):
+  Line 15045, add after the early-return guard (line 15047):
+    if event_type == "tool_progress" and _stream_consumer is not None:
+        _stream_consumer.inject(message)
+        return
+
+That is it. All other pieces (consumer constructor, delta callback wiring,
+start/finish lifecycle, config resolution) already work correctly once the
+config fields reach StreamConsumerConfig.

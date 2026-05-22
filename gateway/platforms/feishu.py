@@ -111,10 +111,28 @@ try:
     )
     from lark_oapi.event.dispatcher_handler import EventDispatcherHandler
     from lark_oapi.ws import Client as FeishuWSClient
+    from lark_oapi.api.cardkit.v1 import (
+        CreateCardRequest,
+        CreateCardRequestBody,
+        ContentCardElementRequest,
+        ContentCardElementRequestBody,
+        SettingsCardRequest,
+        SettingsCardRequestBody,
+        UpdateCardRequest,
+        UpdateCardRequestBody,
+    )
+    from lark_oapi.api.im.v1 import (
+        CreateMessageReactionRequest,
+        CreateMessageReactionRequestBody,
+        DeleteMessageReactionRequest,
+    )
+    from lark_oapi.api.im.v1.model.emoji import Emoji
 
     FEISHU_AVAILABLE = True
+    FEISHU_CARDKIT_AVAILABLE = True
 except ImportError:
     FEISHU_AVAILABLE = False
+    FEISHU_CARDKIT_AVAILABLE = False
     lark = None  # type: ignore[assignment]
     CallBackCard = None  # type: ignore[assignment]
     P2CardActionTriggerResponse = None  # type: ignore[assignment]
@@ -122,6 +140,14 @@ except ImportError:
     FeishuWSClient = None  # type: ignore[assignment]
     FEISHU_DOMAIN = None  # type: ignore[assignment]
     LARK_DOMAIN = None  # type: ignore[assignment]
+    CreateCardRequest = None  # type: ignore[assignment]
+    CreateCardRequestBody = None  # type: ignore[assignment]
+    ContentCardElementRequest = None  # type: ignore[assignment]
+    ContentCardElementRequestBody = None  # type: ignore[assignment]
+    SettingsCardRequest = None  # type: ignore[assignment]
+    SettingsCardRequestBody = None  # type: ignore[assignment]
+    UpdateCardRequest = None  # type: ignore[assignment]
+    UpdateCardRequestBody = None  # type: ignore[assignment]
 
 FEISHU_WEBSOCKET_AVAILABLE = websockets is not None
 FEISHU_WEBHOOK_AVAILABLE = aiohttp is not None
@@ -239,6 +265,17 @@ _FEISHU_REACTION_FAILURE = "CrossMark"
 # drain on completion; the cap is a safeguard against unbounded growth from
 # delete-failures, not a capacity plan.
 _FEISHU_PROCESSING_REACTION_CACHE_SIZE = 1024
+
+# ---------------------------------------------------------------------------
+# CardKit streaming card constants
+# ---------------------------------------------------------------------------
+_STREAMING_CARD_ELEMENT_ID = "streaming_md_1"
+_STREAMING_LOADING_ELEMENT_ID = "streaming_loading"
+_STREAMING_LOADING_ICON_KEY = "img_v3_02vb_496bec09-4b43-4773-ad6b-0cdd103cd2bg"
+_TYPING_EMOJI_TYPE = "Typing"
+_STREAMING_CARD_PRINT_FREQUENCY_MS = 50
+_STREAMING_CARD_PRINT_STEP = 2
+_STREAMING_CARD_PRINT_STRATEGY = "fast"
 
 # QR onboarding constants
 _ONBOARD_ACCOUNTS_URLS = {
@@ -410,6 +447,20 @@ class FeishuBatchState:
     events: Dict[str, MessageEvent] = field(default_factory=dict)
     tasks: Dict[str, asyncio.Task] = field(default_factory=dict)
     counts: Dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class _FeishuStreamingCard:
+    """Tracks state for a single streaming card session."""
+
+    card_id: str
+    element_id: str
+    message_id: str
+    sequence: int = 1
+    last_sent_content: str = ""
+    created_at: float = 0.0
+    typing_reaction_id: Optional[str] = None
+    reply_to_message_id: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -1467,6 +1518,10 @@ class FeishuAdapter(BasePlatformAdapter):
         # Feishu reaction deletion requires the opaque reaction_id returned
         # by create, so we cache it per message_id.
         self._pending_processing_reactions: "OrderedDict[str, str]" = OrderedDict()
+        # CardKit streaming card state (message_id → _FeishuStreamingCard)
+        self._streaming_cards: Dict[str, _FeishuStreamingCard] = {}
+        # Early typing reactions: inbound message_id → reaction_id
+        self._early_typing_reactions: Dict[str, str] = {}
         self._load_seen_message_ids()
 
     @staticmethod
@@ -1819,9 +1874,19 @@ class FeishuAdapter(BasePlatformAdapter):
         *,
         finalize: bool = False,
     ) -> SendResult:
-        """Edit a previously sent Feishu text/post message."""
+        """Edit a previously sent Feishu text/post message.
+
+        If the *message_id* is associated with an active streaming card
+        (created via :meth:`send_streaming_card`), the edit is performed via
+        the CardKit streaming text update API instead of the regular IM update.
+        """
         if not self._client:
             return SendResult(success=False, error="Not connected")
+
+        # --- CardKit streaming card path ---
+        sc = self._streaming_cards.get(message_id)
+        if sc is not None:
+            return await self._update_streaming_card_content(sc, content)
 
         content = self.format_message(content)
         try:
@@ -1845,6 +1910,318 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("[Feishu] Failed to edit message %s: %s", message_id, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
+
+    # =========================================================================
+    # CardKit streaming card support
+    # =========================================================================
+
+    @property
+    def streaming_cards_enabled(self) -> bool:
+        """Return *True* if the CardKit streaming API is usable."""
+        return bool(FEISHU_CARDKIT_AVAILABLE and self._client)
+
+    async def send_streaming_card(
+        self,
+        chat_id: str,
+        content: str = "",
+        *,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Create a streaming card entity and send it as a message."""
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+        if not FEISHU_CARDKIT_AVAILABLE:
+            return SendResult(success=False, error="CardKit SDK not available")
+
+        try:
+            # 1. Create card entity with streaming_mode enabled
+            card_json = self._build_streaming_card_json(content)
+            create_body = (
+                CreateCardRequestBody.builder()
+                .type("card_json")
+                .data(json.dumps(card_json, ensure_ascii=False))
+                .build()
+            )
+            create_req = (
+                CreateCardRequest.builder()
+                .request_body(create_body)
+                .build()
+            )
+            create_resp = await asyncio.to_thread(
+                self._client.cardkit.v1.card.create, create_req,
+            )
+            if not create_resp or create_resp.code != 0:
+                err_msg = getattr(create_resp, "msg", "unknown error") if create_resp else "no response"
+                logger.warning("[Feishu] CardKit card.create failed: code=%s msg=%s",
+                               getattr(create_resp, "code", "?"), err_msg)
+                return SendResult(success=False, error=f"CardKit create failed: {err_msg}")
+
+            card_id = create_resp.data.card_id
+            logger.debug("[Feishu] Created streaming card: %s", card_id)
+
+            # 2. Send the card as a message via IM API
+            card_content = json.dumps(
+                {"type": "card", "data": {"card_id": card_id}},
+                ensure_ascii=False,
+            )
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=card_content,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+            result = self._finalize_send_result(response, "send streaming card failed")
+            if not result.success:
+                return result
+
+            message_id = result.message_id
+
+            # 3. Add "Typing" reaction to original message (best-effort)
+            typing_reaction_id: Optional[str] = None
+            if reply_to:
+                # Check for an existing early typing reaction from on_processing_start
+                early_rid = self._early_typing_reactions.pop(reply_to, None)
+                if early_rid:
+                    typing_reaction_id = early_rid
+                    logger.debug("[Feishu] Reusing early typing reaction for %s → %s",
+                                 reply_to, typing_reaction_id)
+                else:
+                    try:
+                        react_body = (
+                            CreateMessageReactionRequestBody.builder()
+                            .reaction_type(
+                                Emoji.builder().emoji_type(_TYPING_EMOJI_TYPE).build()
+                            )
+                            .build()
+                        )
+                        react_req = (
+                            CreateMessageReactionRequest.builder()
+                            .message_id(reply_to)
+                            .request_body(react_body)
+                            .build()
+                        )
+                        react_resp = await asyncio.to_thread(
+                            self._client.im.v1.message_reaction.create, react_req,
+                        )
+                        if react_resp and react_resp.code == 0:
+                            typing_reaction_id = getattr(react_resp.data, "reaction_id", None)
+                            logger.debug("[Feishu] Added Typing reaction to %s → %s",
+                                         reply_to, typing_reaction_id)
+                    except Exception as react_exc:
+                        logger.debug("[Feishu] Failed to add Typing reaction: %s", react_exc)
+
+            # 4. Track the streaming card state
+            sc = _FeishuStreamingCard(
+                card_id=card_id,
+                element_id=_STREAMING_CARD_ELEMENT_ID,
+                message_id=message_id,
+                sequence=1,
+                created_at=time.time(),
+                typing_reaction_id=typing_reaction_id,
+                reply_to_message_id=reply_to,
+                last_sent_content=content,
+            )
+            self._streaming_cards[message_id] = sc
+            logger.debug("[Feishu] Streaming card %s linked to message %s", card_id, message_id)
+            return result
+
+        except Exception as exc:
+            logger.error("[Feishu] send_streaming_card error: %s", exc, exc_info=True)
+            return SendResult(success=False, error=str(exc))
+
+    async def _update_streaming_card_content(
+        self,
+        sc: "_FeishuStreamingCard",
+        content: str,
+    ) -> SendResult:
+        """Push a streaming text update to a card element."""
+        try:
+            prev = sc.last_sent_content
+            if content.startswith(prev) and len(content) > len(prev):
+                send_content = content
+                logger.debug("[Feishu] CardKit delta: +%d chars (total %d)",
+                             len(content) - len(prev), len(content))
+            else:
+                send_content = content
+
+            sc.sequence += 1
+            body = (
+                ContentCardElementRequestBody.builder()
+                .uuid(str(uuid.uuid4()))
+                .sequence(sc.sequence)
+                .content(send_content)
+                .build()
+            )
+            req = (
+                ContentCardElementRequest.builder()
+                .card_id(sc.card_id)
+                .element_id(sc.element_id)
+                .request_body(body)
+                .build()
+            )
+            resp = await asyncio.to_thread(
+                self._client.cardkit.v1.card_element.content, req,
+            )
+            if resp and resp.code == 0:
+                sc.last_sent_content = content
+                return SendResult(success=True, message_id=sc.message_id)
+            err_msg = getattr(resp, "msg", "unknown") if resp else "no response"
+            logger.warning("[Feishu] Streaming card content update failed: code=%s msg=%s",
+                           getattr(resp, "code", "?"), err_msg)
+            return SendResult(success=False, error=f"streaming update failed: {err_msg}")
+        except Exception as exc:
+            logger.error("[Feishu] _update_streaming_card_content error: %s", exc, exc_info=True)
+            return SendResult(success=False, error=str(exc))
+
+    async def stop_streaming_card(self, message_id: str, *, status: str = "completed") -> bool:
+        """Disable streaming mode on a card and clean up tracking state.
+
+        *status* controls the footer: "completed", "terminated", or "continued".
+        Returns True on success.  Safe to call for non-streaming messages.
+        """
+        sc = self._streaming_cards.pop(message_id, None)
+        if sc is None:
+            return True
+        if not self._client:
+            return False
+        try:
+            from lark_oapi.api.cardkit.v1.model.card import Card
+
+            # Step 1: disable streaming mode
+            sc.sequence += 1
+            settings_json = json.dumps({"config": {"streaming_mode": False}}, ensure_ascii=False)
+            body = (
+                SettingsCardRequestBody.builder()
+                .settings(settings_json)
+                .sequence(sc.sequence)
+                .build()
+            )
+            req = (
+                SettingsCardRequest.builder()
+                .card_id(sc.card_id)
+                .request_body(body)
+                .build()
+            )
+            resp = await asyncio.to_thread(
+                self._client.cardkit.v1.card.settings, req,
+            )
+
+            # Step 2: replace entire card body (removes loading indicator)
+            elapsed_sec = (time.time() - sc.created_at)
+            elapsed_str = f"{elapsed_sec:.1f}s" if elapsed_sec < 60 else f"{int(elapsed_sec // 60)}m {int(elapsed_sec % 60)}s"
+            _STATUS_FOOTERS = {
+                "completed": f"✅ 已完成 · 耗时 {elapsed_str}",
+                "terminated": f"⏹ 已终止 · 耗时 {elapsed_str}",
+                "continued": f"⏸ 待续 → · 耗时 {elapsed_str}",
+            }
+            footer_content = _STATUS_FOOTERS.get(status, _STATUS_FOOTERS["completed"])
+
+            final_elements = [
+                {
+                    "tag": "markdown",
+                    "content": sc.last_sent_content,
+                    "element_id": _STREAMING_CARD_ELEMENT_ID,
+                },
+                {
+                    "tag": "markdown",
+                    "content": footer_content,
+                    "text_size": "notation",
+                },
+            ]
+            final_card_json = {
+                "schema": "2.0",
+                "config": {"streaming_mode": False},
+                "body": {"elements": final_elements},
+            }
+            sc.sequence += 1
+            update_body = (
+                UpdateCardRequestBody.builder()
+                .card(
+                    Card.builder()
+                    .type("card_json")
+                    .data(json.dumps(final_card_json, ensure_ascii=False))
+                    .build()
+                )
+                .uuid(str(uuid.uuid4()))
+                .sequence(sc.sequence)
+                .build()
+            )
+            update_req = (
+                UpdateCardRequest.builder()
+                .card_id(sc.card_id)
+                .request_body(update_body)
+                .build()
+            )
+            update_resp = await asyncio.to_thread(
+                self._client.cardkit.v1.card.update, update_req,
+            )
+            if update_resp and update_resp.code != 0:
+                logger.warning("[Feishu] Failed to replace final card body: code=%s msg=%s",
+                               getattr(update_resp, "code", "?"), getattr(update_resp, "msg", "?"))
+
+            # Step 3: remove "Typing" reaction from original message
+            if sc.typing_reaction_id and sc.reply_to_message_id:
+                try:
+                    del_req = (
+                        DeleteMessageReactionRequest.builder()
+                        .message_id(sc.reply_to_message_id)
+                        .reaction_id(sc.typing_reaction_id)
+                        .build()
+                    )
+                    await asyncio.to_thread(
+                        self._client.im.v1.message_reaction.delete, del_req,
+                    )
+                    logger.debug("[Feishu] Removed Typing reaction from %s",
+                                 sc.reply_to_message_id)
+                except Exception as del_exc:
+                    logger.debug("[Feishu] Failed to remove Typing reaction: %s", del_exc)
+
+            if resp and resp.code == 0:
+                logger.debug("[Feishu] Stopped streaming card %s", sc.card_id)
+                return True
+            logger.warning("[Feishu] Failed to stop streaming card %s: code=%s msg=%s",
+                           sc.card_id, getattr(resp, "code", "?"), getattr(resp, "msg", "?"))
+            return False
+        except Exception as exc:
+            logger.error("[Feishu] stop_streaming_card error: %s", exc, exc_info=True)
+            return False
+
+    @staticmethod
+    def _build_streaming_card_json(initial_content: str = "") -> dict:
+        """Build a Card JSON 2.0 structure with streaming mode enabled."""
+        return {
+            "schema": "2.0",
+            "config": {
+                "streaming_mode": True,
+                "summary": {"content": ""},
+                "streaming_config": {
+                    "print_frequency_ms": {"default": _STREAMING_CARD_PRINT_FREQUENCY_MS},
+                    "print_step": {"default": _STREAMING_CARD_PRINT_STEP},
+                    "print_strategy": _STREAMING_CARD_PRINT_STRATEGY,
+                },
+            },
+            "body": {
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "content": initial_content,
+                        "element_id": _STREAMING_CARD_ELEMENT_ID,
+                    },
+                    {
+                        "tag": "markdown",
+                        "content": " ",
+                        "icon": {
+                            "tag": "custom_icon",
+                            "img_key": _STREAMING_LOADING_ICON_KEY,
+                            "size": "16px 16px",
+                        },
+                        "element_id": _STREAMING_LOADING_ELEMENT_ID,
+                    },
+                ],
+            },
+        }
 
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
@@ -2822,7 +3199,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 .build()
             )
             response = await asyncio.to_thread(self._client.im.v1.message_reaction.create, request)
-            if response and getattr(response, "success", lambda: False)():
+            if response and response.code == 0:
                 data = getattr(response, "data", None)
                 return getattr(data, "reaction_id", None)
             logger.debug(
@@ -2882,6 +3259,18 @@ class FeishuAdapter(BasePlatformAdapter):
         return self._pending_processing_reactions.pop(message_id, None)
 
     async def on_processing_start(self, event: MessageEvent) -> None:
+        # --- Early typing reaction: instant visual feedback ---
+        message_id = getattr(event, "message_id", None)
+        if message_id:
+            early_rid = await self._add_reaction(message_id, _TYPING_EMOJI_TYPE)
+            if early_rid:
+                self._early_typing_reactions[message_id] = early_rid
+                logger.debug(
+                    "[Feishu] Early typing reaction added to %s → %s",
+                    message_id, early_rid,
+                )
+
+        # --- Processing reaction: standard lifecycle ---
         if not self._reactions_enabled():
             return
         message_id = event.message_id
@@ -2894,6 +3283,7 @@ class FeishuAdapter(BasePlatformAdapter):
     async def on_processing_complete(
         self, event: MessageEvent, outcome: ProcessingOutcome
     ) -> None:
+        # --- Processing reaction: standard lifecycle ---
         if not self._reactions_enabled():
             return
         message_id = event.message_id
@@ -2903,14 +3293,33 @@ class FeishuAdapter(BasePlatformAdapter):
         start_reaction_id = self._pending_processing_reactions.get(message_id)
         if start_reaction_id:
             if not await self._remove_reaction(message_id, start_reaction_id):
-                # Don't stack a second badge on top of a Typing we couldn't
-                # remove — UI would read as both "working" and "done/failed"
-                # simultaneously. Keep the handle so LRU eventually evicts it.
                 return
             self._pop_processing_reaction(message_id)
 
         if outcome is ProcessingOutcome.FAILURE:
             await self._add_reaction(message_id, _FEISHU_REACTION_FAILURE)
+
+        # --- Early typing reaction: clean up orphan ---
+        early_rid = self._early_typing_reactions.pop(message_id, None)
+        if early_rid:
+            for sc in self._streaming_cards.values():
+                if sc.reply_to_message_id == message_id and sc.typing_reaction_id == early_rid:
+                    self._early_typing_reactions[message_id] = early_rid
+                    return
+            try:
+                del_req = (
+                    DeleteMessageReactionRequest.builder()
+                    .message_id(message_id)
+                    .reaction_id(early_rid)
+                    .build()
+                )
+                await asyncio.to_thread(
+                    self._client.im.v1.message_reaction.delete, del_req,
+                )
+                logger.debug("[Feishu] Cleaned up early typing reaction on %s", message_id)
+            except Exception:
+                logger.debug("[Feishu] Failed to clean up early typing reaction on %s",
+                             message_id, exc_info=True)
 
     # =========================================================================
     # Webhook server and security

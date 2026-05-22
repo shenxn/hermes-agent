@@ -369,6 +369,11 @@ class StreamingConfig:
     # Telegram only (other platforms ignore the setting).  Default 60s
     # matches the OpenClaw rollout.  Set to 0 to disable.
     fresh_final_after_seconds: float = 60.0
+    # CardKit streaming mode for Feishu — uses lark_oapi CardKit API to
+    # create and update cards in real-time instead of im.v1.message.update.
+    # When set to "cardkit", the stream consumer routes through CardKit
+    # methods on the Feishu adapter.
+    streaming_mode: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -378,6 +383,7 @@ class StreamingConfig:
             "buffer_threshold": self.buffer_threshold,
             "cursor": self.cursor,
             "fresh_final_after_seconds": self.fresh_final_after_seconds,
+            "streaming_mode": self.streaming_mode,
         }
 
     @classmethod
@@ -397,6 +403,7 @@ class StreamingConfig:
             fresh_final_after_seconds=_coerce_float(
                 data.get("fresh_final_after_seconds"), 60.0
             ),
+            streaming_mode=data.get("streaming_mode", ""),
         )
 
 
