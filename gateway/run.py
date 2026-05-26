@@ -14664,6 +14664,43 @@ class GatewayRunner:
             if not progress_queue or not _run_still_current():
                 return
 
+            # CardKit + merge_segments: inject tool progress directly into
+            # the streaming card instead of sending a separate message bubble.
+            # Use stream_consumer_holder (mutable list in outer scope) because
+            # _stream_consumer is a local variable inside run_sync() and not
+            # visible from this closure.
+            _sc = stream_consumer_holder[0]
+            logger.debug("[CARDKIT-DBG] progress_callback: _sc=%s, sm=%s, ms=%s",
+                _sc is not None,
+                getattr(getattr(_sc, "cfg", None), "streaming_mode", "N/A") if _sc else "N/A",
+                getattr(getattr(_sc, "cfg", None), "merge_segments", "N/A") if _sc else "N/A")
+            if (
+                _sc is not None
+                and getattr(getattr(_sc, "cfg", None), "streaming_mode", "") == "cardkit"
+                and getattr(getattr(_sc, "cfg", None), "merge_segments", False)
+            ):
+                emoji_map = {"tool.started": "🔍", "tool.completed": "✅", "tool.error": "❌"}
+                emoji = emoji_map.get(event_type, "🔧")
+                if tool_name:
+                    if preview:
+                        msg = f"{emoji} {tool_name}: \"{preview}\""
+                    elif args:
+                        from agent.display import get_tool_preview_max_len
+                        _pl = get_tool_preview_max_len()
+                        args_str = json.dumps(args, ensure_ascii=False, default=str)
+                        if _pl > 0 and len(args_str) > _pl:
+                            args_str = args_str[:_pl - 3] + "..."
+                        msg = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
+                    else:
+                        msg = f"{emoji} {tool_name}..."
+                else:
+                    msg = message if 'message' in kwargs else str(event_type)
+                try:
+                    _sc.inject(msg)
+                except Exception:
+                    pass
+                return
+
             # First-touch onboarding: the first time a tool takes longer than
             # _LONG_TOOL_THRESHOLD_S during a run that's streaming every tool
             # (progress_mode == "all"), append a one-time hint suggesting
@@ -14802,6 +14839,12 @@ class GatewayRunner:
             if not adapter:
                 return
 
+            # CardKit + merge_segments: tool progress is injected directly
+            # into the streaming card via progress_callback→inject(). Skip
+            # the separate progress-message bubble path entirely — otherwise
+            # each tool fires as a standalone card AND gets injected.
+            _is_cardkit_merge = False
+
             # Skip tool progress for platforms that don't support message
             # editing (e.g. iMessage/BlueBubbles) — each progress update
             # would become a separate message bubble, which is noisy.
@@ -14828,6 +14871,28 @@ class GatewayRunner:
                             except Exception:
                                 break
                         return
+
+                    # CardKit + merge_segments: once the stream consumer is
+                    # created and is in cardkit mode, drain the queue
+                    # silently.  Tool progress is routed through inject()
+                    # by progress_callback instead of separate bubbles.
+                    if not _is_cardkit_merge:
+                        _sc_check = stream_consumer_holder[0]
+                        if (
+                            _sc_check
+                            and getattr(getattr(_sc_check, "cfg", None), "streaming_mode", "") == "cardkit"
+                            and getattr(getattr(_sc_check, "cfg", None), "merge_segments", False)
+                        ):
+                            _is_cardkit_merge = True
+                    if _is_cardkit_merge:
+                        # Drain silently
+                        while not progress_queue.empty():
+                            try:
+                                progress_queue.get_nowait()
+                            except Exception:
+                                break
+                        await asyncio.sleep(0.3)
+                        continue
 
                     raw = progress_queue.get_nowait()
 
@@ -15052,9 +15117,12 @@ class GatewayRunner:
             if not _status_adapter or not _run_still_current():
                 return
             # Inject tool-progress into streaming message when merge_segments is on
-            if event_type == "tool_progress" and _stream_consumer is not None:
+            # Use stream_consumer_holder (same reason as progress_callback).
+            _sc = stream_consumer_holder[0]
+            logger.debug("[CARDKIT-DBG] _status_callback_sync: event=%s, _sc=%s", event_type, _sc is not None)
+            if event_type == "tool_progress" and _sc is not None:
                 try:
-                    _stream_consumer.inject(message)
+                    _sc.inject(message)
                 except Exception:
                     pass
                 return
@@ -15890,6 +15958,20 @@ class GatewayRunner:
                 except Exception:
                     pass
 
+            # CardKit double-delivery guard: when the stream consumer already
+            # delivered the final response via an in-place edit of the streaming
+            # card, returning final_response here would cause base.py's
+            # _process_message_background to send a SECOND standalone message
+            # with the same text.  Suppress it so only the card survives.
+            _sc = stream_consumer_holder[0]
+            _already_streamed_by_card = bool(
+                _sc
+                and getattr(_sc, "_uses_streaming_card", False)
+                and getattr(_sc, "final_response_sent", False)
+            )
+            if _already_streamed_by_card:
+                final_response = ""
+
             return {
                 "final_response": final_response,
                 "last_reasoning": result.get("last_reasoning"),
@@ -15908,7 +15990,7 @@ class GatewayRunner:
                 "model": _resolved_model,
                 "context_length": _context_length,
                 "session_id": effective_session_id,
-                "response_previewed": result.get("response_previewed", False),
+                "response_previewed": result.get("response_previewed", False) or _already_streamed_by_card,
             }
         
         # Start progress message sender if enabled
