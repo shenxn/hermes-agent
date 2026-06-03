@@ -253,6 +253,10 @@ def _get_firecrawl_client() -> Any:
 
     # Construct via the re-exported Firecrawl proxy on tools.web_tools so
     # unit tests patching ``tools.web_tools.Firecrawl`` see their mock.
+    # Default timeout=300s prevents indefinite hangs on unresponsive Firecrawl
+    # API calls (search, scrape, etc.).  Users can override via
+    # FIRECRAWL_TIMEOUT env var if needed.
+    kwargs.setdefault("timeout", float(os.environ.get("FIRECRAWL_TIMEOUT", "300")))
     _wt._firecrawl_client = _wt.Firecrawl(**kwargs)
     _wt._firecrawl_client_config = client_config
     return _wt._firecrawl_client

@@ -900,14 +900,20 @@ async def web_extract_tool(
     try:
         logger.info("Extracting content from %d URL(s)", len(urls))
 
-        # ── SSRF protection — filter out private/internal URLs before any backend ──
+        # ── SSRF protection — filter out dangerous URLs before any backend ──
+        # All current extract backends (firecrawl, tavily, exa, parallel) are
+        # remote APIs — they fetch URLs from *their* servers, not ours.  Local
+        # DNS resolution + private-IP blocking would be wrong (see: m.andar.co.kr
+        # resolving to 198.18.58.223 via CDN).  We only block cloud metadata
+        # endpoints (169.254.169.254, etc.) which should never be sent anywhere.
+        from tools.url_safety import is_always_blocked_url
         safe_urls = []
         ssrf_blocked: List[Dict[str, Any]] = []
         for url in urls:
-            if not is_safe_url(url):
+            if is_always_blocked_url(url):
                 ssrf_blocked.append({
                     "url": url, "title": "", "content": "",
-                    "error": "Blocked: URL targets a private or internal network address",
+                    "error": "Blocked: URL targets a cloud metadata endpoint",
                 })
             else:
                 safe_urls.append(url)
@@ -1231,10 +1237,13 @@ async def web_crawl_tool(
             if not url.startswith(('http://', 'https://')):
                 url = f'https://{url}'
 
-            # SSRF protection — block private/internal addresses
-            if not is_safe_url(url):
+            # SSRF protection — only block cloud metadata endpoints.
+            # All crawl backends (firecrawl, etc.) are remote APIs; they fetch
+            # from their servers, not ours, so local DNS checks are wrong.
+            from tools.url_safety import is_always_blocked_url
+            if is_always_blocked_url(url):
                 return json.dumps({"results": [{"url": url, "title": "", "content": "",
-                    "error": "Blocked: URL targets a private or internal network address"}]}, ensure_ascii=False)
+                    "error": "Blocked: URL targets a cloud metadata endpoint"}]}, ensure_ascii=False)
 
             # Website policy check
             blocked = check_website_access(url)

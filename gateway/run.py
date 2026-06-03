@@ -14636,6 +14636,7 @@ class GatewayRunner:
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
+        _cardkit_last_tool = [None]  # Dedup: tool_name from last CardKit inject
 
         # Auto-cleanup of temporary progress bubbles (Telegram + any adapter
         # that implements ``delete_message``). When enabled via
@@ -14681,20 +14682,30 @@ class GatewayRunner:
             ):
                 emoji_map = {"tool.started": "🔍", "tool.completed": "✅", "tool.error": "❌"}
                 emoji = emoji_map.get(event_type, "🔧")
+                _CARDKIT_INJECT_MAX = 40  # hard cap for streaming cards
+                # Dedup: skip completed inject if tool_name matches last started
+                if event_type == "tool.completed" and tool_name and tool_name == _cardkit_last_tool[0]:
+                    return
                 if tool_name:
+                    _cardkit_last_tool[0] = tool_name
                     if preview:
                         msg = f"{emoji} {tool_name}: \"{preview}\""
                     elif args:
                         from agent.display import get_tool_preview_max_len
                         _pl = get_tool_preview_max_len()
+                        # CardKit: enforce a hard cap regardless of config
+                        _effective_pl = min(_pl, _CARDKIT_INJECT_MAX) if _pl > 0 else _CARDKIT_INJECT_MAX
                         args_str = json.dumps(args, ensure_ascii=False, default=str)
-                        if _pl > 0 and len(args_str) > _pl:
-                            args_str = args_str[:_pl - 3] + "..."
+                        if len(args_str) > _effective_pl:
+                            args_str = args_str[:_effective_pl - 3] + "..."
                         msg = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
                     else:
                         msg = f"{emoji} {tool_name}..."
                 else:
                     msg = message if 'message' in kwargs else str(event_type)
+                # Hard-cap the entire message for CardKit display
+                if len(msg) > _CARDKIT_INJECT_MAX:
+                    msg = msg[:_CARDKIT_INJECT_MAX - 3] + "..."
                 try:
                     _sc.inject(msg)
                 except Exception:
@@ -15116,15 +15127,23 @@ class GatewayRunner:
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
                 return
-            # Inject tool-progress into streaming message when merge_segments is on
+            # Inject ALL status messages into streaming card when CardKit+merge is active.
+            # This covers lifecycle events (rate limited, fallback, compressed, etc.)
+            # and warn events, not just tool_progress.
             # Use stream_consumer_holder (same reason as progress_callback).
             _sc = stream_consumer_holder[0]
-            logger.debug("[CARDKIT-DBG] _status_callback_sync: event=%s, _sc=%s", event_type, _sc is not None)
-            if event_type == "tool_progress" and _sc is not None:
+            if _sc is not None:
                 try:
                     _sc.inject(message)
                 except Exception:
                     pass
+                return
+            # No active streaming card: transient status (retry, rate-limit, compression)
+            # would create noisy separate bubbles. Suppress — the "Still working"
+            # notification covers long waits, and short retries need no user message.
+            # Only send non-transient lifecycle events (e.g. model switch) as fallback.
+            _transient_prefixes = ("⏳", "⏱️", "🗜️", "⚠️ Rate", "⚠️ Max retries", "⚠️ Non-retryable")
+            if any(message.startswith(p) for p in _transient_prefixes):
                 return
             _fut = safe_schedule_threadsafe(
                 _status_adapter.send(
@@ -16120,17 +16139,23 @@ class GatewayRunner:
                     except Exception:
                         pass
                 try:
-                    _notify_res = await _notify_adapter.send(
-                        source.chat_id,
-                        f"⏳ Still working... ({_elapsed_mins} min elapsed{_status_detail})",
-                        metadata=_status_thread_metadata,
-                    )
-                    if (
-                        _cleanup_progress
-                        and getattr(_notify_res, "success", False)
-                        and getattr(_notify_res, "message_id", None)
-                    ):
-                        _cleanup_msg_ids.append(str(_notify_res.message_id))
+                    _notify_msg = f"⏳ Still working... ({_elapsed_mins} min elapsed{_status_detail})"
+                    # CardKit: inject into streaming card instead of separate bubble
+                    _sc = stream_consumer_holder[0]
+                    if _sc is not None:
+                        _sc.inject(_notify_msg)
+                    else:
+                        _notify_res = await _notify_adapter.send(
+                            source.chat_id,
+                            _notify_msg,
+                            metadata=_status_thread_metadata,
+                        )
+                        if (
+                            _cleanup_progress
+                            and getattr(_notify_res, "success", False)
+                            and getattr(_notify_res, "message_id", None)
+                        ):
+                            _cleanup_msg_ids.append(str(_notify_res.message_id))
                 except Exception as _ne:
                     logger.debug("Long-running notification error: %s", _ne)
 
