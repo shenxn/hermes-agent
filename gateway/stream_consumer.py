@@ -434,8 +434,12 @@ class GatewayStreamConsumer:
                         if isinstance(item, tuple) and len(item) == 2 and item[0] is _INJECT:
                             # Tool-progress injection: format as blockquote and append
                             inject_text = item[1].strip()
-                            if inject_text and self._accumulated:
-                                self._accumulated += "\n\n> " + inject_text.replace("\n", "\n> ") + "\n\n"
+                            if inject_text:
+                                if self._accumulated:
+                                    self._accumulated += "\n\n> " + inject_text.replace("\n", "\n> ") + "\n\n"
+                                else:
+                                    # First inject before any model text — seed the card
+                                    self._accumulated = "> " + inject_text.replace("\n", "\n> ") + "\n\n"
                             break
                         self._filter_and_accumulate(item)
                     except queue.Empty:

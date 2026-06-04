@@ -14636,7 +14636,32 @@ class GatewayRunner:
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
-        _cardkit_last_tool = [None]  # Dedup: tool_name from last CardKit inject
+        _cardkit_started_buffer = {}  # {tool_name: {"count": N, "preview": "..."}} for batching
+        _CARDKIT_INJECT_MAX = 40  # hard cap for streaming cards
+
+        def _flush_cardkit_started():
+            """Flush all buffered tool.started entries into the CardKit stream."""
+            if not _cardkit_started_buffer:
+                return
+            _sc_f = stream_consumer_holder[0]
+            if _sc_f is None:
+                _cardkit_started_buffer.clear()
+                return
+            for name, info in _cardkit_started_buffer.items():
+                cnt = info["count"]
+                label = f"🔍 {name}"
+                if cnt > 1:
+                    label += f" ×{cnt}"
+                p = info.get("preview")
+                if p:
+                    label += f": \"{p}\""
+                if len(label) > _CARDKIT_INJECT_MAX:
+                    label = label[:_CARDKIT_INJECT_MAX - 3] + "..."
+                try:
+                    _sc_f.inject(label)
+                except Exception:
+                    pass
+            _cardkit_started_buffer.clear()
 
         # Auto-cleanup of temporary progress bubbles (Telegram + any adapter
         # that implements ``delete_message``). When enabled via
@@ -14680,30 +14705,33 @@ class GatewayRunner:
                 and getattr(getattr(_sc, "cfg", None), "streaming_mode", "") == "cardkit"
                 and getattr(getattr(_sc, "cfg", None), "merge_segments", False)
             ):
-                emoji_map = {"tool.started": "🔍", "tool.completed": "✅", "tool.error": "❌"}
-                emoji = emoji_map.get(event_type, "🔧")
-                _CARDKIT_INJECT_MAX = 40  # hard cap for streaming cards
-                # Dedup: skip completed inject if tool_name matches last started
-                if event_type == "tool.completed" and tool_name and tool_name == _cardkit_last_tool[0]:
+                # ── tool.started: buffer per tool_name, keep preview ──
+                if event_type == "tool.started" and tool_name:
+                    # Flush entries for DIFFERENT tool names (they won't accumulate further)
+                    for prev_name in list(_cardkit_started_buffer.keys()):
+                        if prev_name != tool_name:
+                            _cardkit_started_buffer.pop(prev_name)
+                            _flush_cardkit_started()
+                    # Accumulate same-name calls
+                    if tool_name not in _cardkit_started_buffer:
+                        _cardkit_started_buffer[tool_name] = {"count": 0, "preview": preview}
+                    _cardkit_started_buffer[tool_name]["count"] += 1
+                    if not _cardkit_started_buffer[tool_name].get("preview") and preview:
+                        _cardkit_started_buffer[tool_name]["preview"] = preview
                     return
+
+                # ── tool.completed / _thinking / reasoning: skip, preserve buffer ──
+                if event_type in ("tool.completed", "_thinking", "reasoning.available"):
+                    return
+
+                # ── Only tool.error or truly unexpected events: flush, then handle ──
+                _flush_cardkit_started()
+                emoji_map = {"tool.error": "❌"}
+                emoji = emoji_map.get(event_type, "🔧")
                 if tool_name:
-                    _cardkit_last_tool[0] = tool_name
-                    if preview:
-                        msg = f"{emoji} {tool_name}: \"{preview}\""
-                    elif args:
-                        from agent.display import get_tool_preview_max_len
-                        _pl = get_tool_preview_max_len()
-                        # CardKit: enforce a hard cap regardless of config
-                        _effective_pl = min(_pl, _CARDKIT_INJECT_MAX) if _pl > 0 else _CARDKIT_INJECT_MAX
-                        args_str = json.dumps(args, ensure_ascii=False, default=str)
-                        if len(args_str) > _effective_pl:
-                            args_str = args_str[:_effective_pl - 3] + "..."
-                        msg = f"{emoji} {tool_name}({list(args.keys())})\n{args_str}"
-                    else:
-                        msg = f"{emoji} {tool_name}..."
+                    msg = f"{emoji} {tool_name}..."
                 else:
-                    msg = message if 'message' in kwargs else str(event_type)
-                # Hard-cap the entire message for CardKit display
+                    msg = kwargs.get('message', str(event_type))
                 if len(msg) > _CARDKIT_INJECT_MAX:
                     msg = msg[:_CARDKIT_INJECT_MAX - 3] + "..."
                 try:
@@ -15309,8 +15337,11 @@ class GatewayRunner:
                         )
                         if _want_stream_deltas:
                             def _stream_delta_cb(text: str) -> None:
-                                if _run_still_current():
-                                    _stream_consumer.on_delta(text)
+                                if not _run_still_current():
+                                    return
+                                # Flush pending tool started buffer before first text content
+                                _flush_cardkit_started()
+                                _stream_consumer.on_delta(text)
                         stream_consumer_holder[0] = _stream_consumer
                 except Exception as _sc_err:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
