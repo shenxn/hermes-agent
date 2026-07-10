@@ -794,6 +794,10 @@ class StreamingConfig:
     # Telegram only (other platforms ignore the setting).  Default 0 disables
     # the fresh-message replacement path; set >0 to opt in.
     fresh_final_after_seconds: float = 0.0
+    # Keep tool/status progress in the same streamed message when supported.
+    merge_segments: bool = True
+    # Platform-specific streaming implementation (currently ``cardkit`` for Feishu).
+    streaming_mode: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -803,6 +807,8 @@ class StreamingConfig:
             "buffer_threshold": self.buffer_threshold,
             "cursor": self.cursor,
             "fresh_final_after_seconds": self.fresh_final_after_seconds,
+            "merge_segments": self.merge_segments,
+            "streaming_mode": self.streaming_mode,
         }
 
     @classmethod
@@ -854,6 +860,8 @@ class StreamingConfig:
             fresh_final_after_seconds=_coerce_float(
                 data.get("fresh_final_after_seconds"), 0.0
             ),
+            merge_segments=_coerce_bool(data.get("merge_segments"), True),
+            streaming_mode=str(data.get("streaming_mode", "") or ""),
         )
 
 
