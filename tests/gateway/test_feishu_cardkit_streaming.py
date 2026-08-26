@@ -196,7 +196,11 @@ async def test_cardkit_commentary_stays_in_one_card():
 
     adapter.send_streaming_card.assert_awaited_once()
     adapter.send.assert_not_called()
-    final_text = adapter.edit_message.await_args_list[-1].kwargs["content"]
+    final_text = (
+        adapter.edit_message.await_args_list[-1].kwargs["content"]
+        if adapter.edit_message.await_args_list
+        else adapter.send_streaming_card.await_args.kwargs["content"]
+    )
     assert "开始" in final_text
     assert "正在检查" in final_text
     assert "完成" in final_text
@@ -355,16 +359,16 @@ async def test_stop_failure_retains_card_for_retry_and_final_edits_use_cardkit()
     adapter._client.im.v1.message.update.assert_not_called()
 
 
-def test_title_generation_disabled_skips_worker():
+def test_title_generation_enabled_false_skips_worker():
     from agent.title_generator import maybe_auto_title
 
     db = MagicMock()
     history = [{"role": "user", "content": "hello"}]
     with (
         patch(
-            "hermes_cli.config.load_config",
+            "hermes_cli.config.load_config_readonly",
             return_value={
-                "auxiliary": {"title_generation": {"provider": "disabled"}}
+                "auxiliary": {"title_generation": {"enabled": False}}
             },
         ),
         patch("agent.title_generator.auto_title_session") as worker,

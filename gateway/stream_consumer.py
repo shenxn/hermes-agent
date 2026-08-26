@@ -44,6 +44,7 @@ logger = logging.getLogger("gateway.stream_consumer")
 _DONE = object()
 _NEW_SEGMENT = object()
 _COMMENTARY = object()
+_INJECT = object()
 # Authoritative turn-final payload, enqueued by ``finish(final_text=...)``
 # just before ``_DONE``.  Carries the completed ``final_response`` —
 # including post-stream augmentation (file-mutation verifier footer,
@@ -159,6 +160,8 @@ class StreamConsumerConfig:
     # "group", "supergroup", "forum").  Used to gate native draft streaming,
     # which is platform-specific (Telegram drafts are DM-only).
     chat_type: str = ""
+    merge_segments: bool = True
+    streaming_mode: str = ""
 
 
 class GatewayStreamConsumer:
@@ -326,6 +329,9 @@ class GatewayStreamConsumer:
         # Think-block filter state (mirrors CLI's _stream_delta tag suppression)
         self._in_think_block = False
         self._think_buffer = ""
+        # Model-only visible text. CardKit progress/status injections are kept
+        # out so a final bare NO_REPLY marker can still be suppressed.
+        self._model_accumulated = ""
 
         # Native draft-streaming state.  Resolved at the start of run() based
         # on cfg.transport, cfg.chat_type, and the adapter's
@@ -341,6 +347,15 @@ class GatewayStreamConsumer:
         # this response and route through edit-based for graceful degradation.
         self._draft_failures = 0
         self._before_finalize_notified = False
+        self._uses_streaming_card = (
+            self.cfg.streaming_mode == "cardkit"
+            and getattr(adapter, "streaming_cards_enabled", False) is True
+        )
+        self._streaming_card_stopped = False
+        self._streaming_card_stop_status: Optional[str] = None
+        self._cardkit_message_ids: set[str] = set()
+        self._cardkit_overflowed = False
+        self._cardkit_injected_lines: list[str] = []
 
     def _stream_is_message(self) -> bool:
         """Whether THIS chat's transport treats the stream as the message.
@@ -406,6 +421,14 @@ class GatewayStreamConsumer:
         """True when the final response content reached the user, even if
         the subsequent cosmetic edit (cursor removal) failed."""
         return self._final_content_delivered
+
+    @property
+    def cardkit_overflowed(self) -> bool:
+        return self._cardkit_overflowed
+
+    @property
+    def cardkit_message_ids(self) -> tuple[str, ...]:
+        return tuple(self._cardkit_message_ids)
 
     async def _notify_before_finalize(self) -> None:
         """Run the pre-finalize hook exactly once, swallowing hook errors."""
@@ -622,6 +645,7 @@ class GatewayStreamConsumer:
         self._message_id = None
         self._message_created_ts = None
         self._accumulated = ""
+        self._model_accumulated = ""
         self._stream_ledger = ""
         self._last_sent_text = ""
         self._fallback_final_send = False
@@ -684,6 +708,11 @@ class GatewayStreamConsumer:
         if final_text is not None:
             self._queue.put((_FINAL_TEXT, final_text))
         self._queue.put(_DONE)
+
+    def inject(self, text: str) -> None:
+        """Thread-safely append a progress line to an active CardKit stream."""
+        if self._uses_streaming_card and self.cfg.merge_segments and text:
+            self._queue.put((_INJECT, str(text)))
 
     # ── Think-block filtering ────────────────────────────────────────
     # Models like MiniMax emit inline <think>...</think> blocks in their
@@ -881,6 +910,7 @@ class GatewayStreamConsumer:
                 # delivered after the user has already moved on.
                 if not self._run_still_current():
                     await self._abandon_native_stream()
+                    await self._stop_streaming_card_if_active(status="terminated")
                     return
 
                 # Drain all available items from the queue
@@ -921,7 +951,14 @@ class GatewayStreamConsumer:
                                 _final_payload = self._clean_for_display(item[1])
                                 _visible = self._clean_for_display(self._accumulated)
                                 if _final_payload and _final_payload != _visible:
-                                    self._accumulated = item[1]
+                                    if self._uses_streaming_card and self._cardkit_injected_lines:
+                                        _progress = "\n\n".join(
+                                            f"> {line}" for line in self._cardkit_injected_lines
+                                        )
+                                        self._accumulated = f"{_progress}\n\n{item[1]}"
+                                    else:
+                                        self._accumulated = item[1]
+                                    self._model_accumulated = item[1]
                                     self._stream_ledger = item[1]
                             elif _streamed_something and self._turn_split_delivery:
                                 # Split delivery + authoritative final (review
@@ -951,8 +988,21 @@ class GatewayStreamConsumer:
                                     self._stream_ledger = _final_raw
                             continue
                         if isinstance(item, tuple) and len(item) == 2 and item[0] is _COMMENTARY:
+                            if self._uses_streaming_card and self.cfg.merge_segments:
+                                before = self._accumulated
+                                self._filter_and_accumulate(str(item[1]))
+                                if self._accumulated.startswith(before):
+                                    self._model_accumulated += self._accumulated[len(before):]
+                                continue
                             commentary_text = item[1]
                             break
+                        if isinstance(item, tuple) and len(item) == 2 and item[0] is _INJECT:
+                            line = str(item[1]).strip()
+                            if line:
+                                self._cardkit_injected_lines.append(line)
+                                prefix = "\n\n" if self._accumulated else ""
+                                self._accumulated += f"{prefix}> {line}"
+                            continue
                         if isinstance(item, tuple) and len(item) == 2 and item[0] is _FLUSH:
                             # Flush barrier: finalize the current segment like a
                             # tool boundary, then signal the waiting thread once
@@ -961,7 +1011,10 @@ class GatewayStreamConsumer:
                             got_segment_break = True
                             flush_event = item[1]
                             break
+                        before = self._accumulated
                         self._filter_and_accumulate(item)
+                        if self._accumulated.startswith(before):
+                            self._model_accumulated += self._accumulated[len(before):]
                     except queue.Empty:
                         break
 
@@ -969,7 +1022,10 @@ class GatewayStreamConsumer:
                 # so trailing text that was waiting for a potential open
                 # tag is not lost.
                 if got_done:
+                    before = self._accumulated
                     self._flush_think_buffer()
+                    if self._accumulated.startswith(before):
+                        self._model_accumulated += self._accumulated[len(before):]
 
                     # Intentional-silence suppression.  When the agent chose
                     # not to reply it emits a bare control marker (NO_REPLY /
@@ -982,8 +1038,9 @@ class GatewayStreamConsumer:
                     # reaches the chat.  Substantive prose that merely mentions
                     # a marker is NOT suppressed (see is_intentional_silence_response).
                     if _is_intentional_silence_response(
-                        self._clean_for_display(self._accumulated)
+                        self._clean_for_display(self._model_accumulated)
                     ):
+                        await self._stop_streaming_card_if_active(status="terminated")
                         await self._suppress_silence_marker()
                         return
 
@@ -1029,7 +1086,7 @@ class GatewayStreamConsumer:
                     and not got_segment_break
                     and commentary_text is None
                     and _is_partial_silence_marker(
-                        self._clean_for_display(self._accumulated)
+                        self._clean_for_display(self._model_accumulated)
                     )
                 ):
                     should_edit = False
@@ -1171,6 +1228,11 @@ class GatewayStreamConsumer:
                             # continuation without dropping content.
                             break
                         self._accumulated = self._accumulated[split_at:].lstrip("\n")
+                        if self._uses_streaming_card:
+                            self._cardkit_overflowed = True
+                            await self._stop_streaming_card_if_active(status="continued")
+                            self._streaming_card_stopped = False
+                            self._streaming_card_stop_status = None
                         self._message_id = None
                         self._last_sent_text = ""
                         # Sealed head chunk delivered — this turn is now a
@@ -1286,6 +1348,7 @@ class GatewayStreamConsumer:
                             if self._final_response_sent:
                                 self._final_content_delivered = True
                                 self._record_turn_final_payload(self._accumulated)
+                    await self._stop_streaming_card_if_active(status="completed")
                     return
 
                 if commentary_text is not None:
@@ -1328,7 +1391,9 @@ class GatewayStreamConsumer:
                     # ``is True`` + _use_draft_streaming: MagicMock adapters
                     # return truthy auto-attributes, and an edit-based run on a
                     # stream-capable adapter still needs the legacy reset.
-                    if (
+                    if self._uses_streaming_card and self.cfg.merge_segments:
+                        pass
+                    elif (
                         self._stream_is_message()
                         and self._use_draft_streaming
                     ):
@@ -1400,6 +1465,7 @@ class GatewayStreamConsumer:
         except Exception as e:
             logger.error("Stream consumer error: %s", e)
         finally:
+            await self._stop_streaming_card_if_active(status="terminated")
             # Safety net: if run() exits (normal return, cancellation, or
             # exception) while a _FLUSH barrier is still queued or was consumed
             # but not yet signaled, wake any waiters now. Without this a caller
@@ -1419,6 +1485,29 @@ class GatewayStreamConsumer:
                 pass
             except Exception:
                 pass
+
+    async def _stop_streaming_card_if_active(self, *, status: str) -> bool:
+        """Finalize an active CardKit card, preserving the first requested status."""
+        if (
+            not self._uses_streaming_card
+            or self._streaming_card_stopped
+            or not self._message_id
+            or self._message_id == "__no_edit__"
+        ):
+            return True
+        if self._streaming_card_stop_status is None:
+            self._streaming_card_stop_status = status
+        effective_status = self._streaming_card_stop_status
+        try:
+            stopped = await self.adapter.stop_streaming_card(
+                self._message_id, status=effective_status
+            )
+            if stopped:
+                self._streaming_card_stopped = True
+            return bool(stopped)
+        except Exception:
+            logger.debug("CardKit stop failed", exc_info=True)
+            return False
 
     # Strip MEDIA:<path> tags before display. Uses the shared anchored
     # MEDIA_TAG_CLEANUP_RE from gateway/platforms/base.py — only tags whose
@@ -2663,18 +2752,31 @@ class GatewayStreamConsumer:
             else:
                 # First message — send new, threaded to the original user message
                 # so it lands in the correct topic/thread.
-                result = await self.adapter.send(
-                    chat_id=self.chat_id,
-                    content=text,
-                    reply_to=self._initial_reply_to_id,
-                    metadata=self._metadata_for_send(
+                send_kwargs = {
+                    "chat_id": self.chat_id,
+                    "content": text,
+                    "reply_to": self._initial_reply_to_id,
+                    "metadata": self._metadata_for_send(
                         final=finalize,
                         expect_edits=not finalize,
                     ),
-                )
+                }
+                if self._uses_streaming_card:
+                    result = await self.adapter.send_streaming_card(**send_kwargs)
+                    if not result.success:
+                        # Runtime capability/API failure: downgrade this consumer
+                        # and retry the ordinary Feishu send with identical args.
+                        self._uses_streaming_card = False
+                        result = await self.adapter.send(**send_kwargs)
+                else:
+                    result = await self.adapter.send(**send_kwargs)
                 if result.success:
                     if result.message_id:
                         self._message_id = result.message_id
+                        if self._uses_streaming_card:
+                            self._cardkit_message_ids.add(str(result.message_id))
+                            self._streaming_card_stopped = False
+                            self._streaming_card_stop_status = None
                         # Track when the preview first became visible to
                         # the user so fresh-final logic can detect stale
                         # preview timestamps on long-running responses.
