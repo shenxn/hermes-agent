@@ -4302,6 +4302,53 @@ class TurnRunner:
     def __init__(self, runner: "GatewayRunner", ctx: TurnContext) -> None:
         self._runner = runner
         self._ctx = ctx
+        from gateway.cardkit_progress import CardKitProgressAggregator
+        self._cardkit_progress = CardKitProgressAggregator()
+        self._cardkit_progress_lock = threading.RLock()
+
+    def _cardkit_consumer(self):
+        """Return this turn's active CardKit consumer, if it really owns output."""
+        ctx = self._ctx
+        if not ctx._run_still_current():
+            return None
+        consumer = (
+            ctx.stream_consumer_holder[0]
+            if ctx.stream_consumer_holder
+            else None
+        )
+        if (
+            consumer is not None
+            and getattr(consumer, "_uses_streaming_card", False) is True
+            and getattr(getattr(consumer, "cfg", None), "merge_segments", False)
+        ):
+            return consumer
+        return None
+
+    def _inject_cardkit_lines(self, lines) -> bool:
+        consumer = self._cardkit_consumer()
+        if consumer is None:
+            return False
+        for line in lines:
+            if line:
+                consumer.inject(str(line)[:400])
+        return True
+
+    def _flush_cardkit_progress(self) -> bool:
+        with self._cardkit_progress_lock:
+            lines = self._cardkit_progress.flush()
+        return self._inject_cardkit_lines(lines)
+
+    def _handle_cardkit_progress(
+        self, event_type: str, tool_name=None, preview=None, **metadata
+    ) -> bool:
+        if self._cardkit_consumer() is None:
+            return False
+        with self._cardkit_progress_lock:
+            consumed, lines = self._cardkit_progress.push(
+                event_type, tool_name, preview, **metadata
+            )
+        self._inject_cardkit_lines(lines)
+        return consumed
 
     def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
@@ -4342,6 +4389,12 @@ class TurnRunner:
                 ctx.log_queue.put(f"{ts}  {tool_name}:{preview_str}".rstrip())
             if not ctx.progress_queue:
                 return
+        # CardKit owns structured tool/subagent progress before the legacy
+        # filters discard identity-bearing events such as subagent.*.
+        if self._handle_cardkit_progress(
+            event_type, tool_name, preview, args=args, **kwargs
+        ):
+            return
         if not ctx.progress_queue or not ctx._run_still_current():
             return
 
@@ -4953,6 +5006,20 @@ class TurnRunner:
 
                 raw = ctx.progress_queue.get_nowait()
 
+                # The consumer may come online after early progress was queued.
+                # Once CardKit owns the turn, drain those early legacy entries
+                # into the card instead of emitting a second progress bubble.
+                if self._cardkit_consumer() is not None:
+                    if isinstance(raw, tuple) and raw:
+                        if raw[0] == "__dedup__" and len(raw) == 3:
+                            self._inject_cardkit_lines([f"{raw[1]} (×{raw[2] + 1})"])
+                        elif raw[0] != "__reset__":
+                            self._inject_cardkit_lines([str(raw)])
+                    else:
+                        self._inject_cardkit_lines([raw])
+                    await asyncio.sleep(0)
+                    continue
+
                 # Drain silently when interrupted: events queued in the
                 # window between tool parse and interrupt processing
                 # should not render as bubbles.  The "⚡ Interrupting
@@ -5325,6 +5392,10 @@ class TurnRunner:
                 _redact_gateway_user_facing_secrets(str(message or ""))[:160],
             )
             return
+        if self._cardkit_consumer() is not None:
+            self._flush_cardkit_progress()
+            self._inject_cardkit_lines([prepared_message])
+            return
         _fut = safe_schedule_threadsafe(
             _send_or_update_status_coro(ctx._status_adapter, ctx._status_chat_id, event_type, prepared_message, ctx._status_thread_metadata),
             ctx._loop_for_step,
@@ -5476,6 +5547,7 @@ class TurnRunner:
                     if _want_stream_deltas:
                         def _stream_delta_cb(text: str) -> None:
                             if ctx._run_still_current():
+                                self._flush_cardkit_progress()
                                 _stream_consumer.on_delta(text)
                                 # Tee to the streaming-TTS consumer (#60671).
                                 if _stts_consumer_ref is not None:
@@ -6454,6 +6526,7 @@ class TurnRunner:
                 _fr = result.get("final_response")
                 if isinstance(_fr, str) and _fr.strip() and _fr != "(empty)":
                     _final_for_stream = _fr
+            self._flush_cardkit_progress()
             if _final_for_stream is not None:
                 # Duck-type safe: test doubles / older consumers may expose a
                 # zero-arg finish(). The payload is an optimization, not a
@@ -27577,6 +27650,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             fresh_final_after_seconds=_fresh_final_secs,
             transport=scfg.transport or "edit",
             chat_type=getattr(source, "chat_type", "") or "",
+            merge_segments=getattr(scfg, "merge_segments", True),
+            streaming_mode=getattr(scfg, "streaming_mode", "") or "",
         )
         return _consumer_cfg, _pause_typing_before_finalize
 
@@ -28858,6 +28933,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     else f"⏳ Working — {_elapsed_mins} min{_status_detail}"
                 )
                 try:
+                    _sc = stream_consumer_holder[0] if stream_consumer_holder else None
+                    if (
+                        _sc is not None
+                        and getattr(_sc, "_uses_streaming_card", False) is True
+                        and getattr(getattr(_sc, "cfg", None), "merge_segments", False)
+                    ):
+                        _sc.inject(_heartbeat_text)
+                        continue
                     _notify_res = None
                     if _heartbeat_msg_id:
                         try:
@@ -29807,17 +29890,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _sc_msg_id = _sc.message_id
                 if _sc_msg_id:
                     try:
-                        await _sc.adapter.edit_message(
+                        _transform_res = await _sc.adapter.edit_message(
                             chat_id=source.chat_id,
                             message_id=_sc_msg_id,
                             content=response["final_response"],
                             finalize=True,
                         )
-                        response["already_sent"] = True
-                        logger.info(
-                            "Edited streamed message %s for session %s to include plugin-transformed content.",
-                            _sc_msg_id, session_key or "?",
-                        )
+                        if getattr(_transform_res, "success", False):
+                            response["already_sent"] = True
+                            logger.info(
+                                "Edited streamed message %s for session %s to include plugin-transformed content.",
+                                _sc_msg_id, session_key or "?",
+                            )
+                        else:
+                            logger.warning(
+                                "Transformed streamed-message edit failed for session %s (%s); sending final response normally.",
+                                session_key or "?",
+                                getattr(_transform_res, "error", None),
+                            )
                     except Exception as _edit_err:
                         logger.warning(
                             "Failed to edit streamed message for session %s: %s",

@@ -1,6 +1,39 @@
 from gateway.cardkit_progress import CardKitProgressAggregator
 
 
+def test_turn_runner_routes_structured_progress_to_active_cardkit():
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from gateway.run import TurnRunner
+
+    consumer = SimpleNamespace(
+        _uses_streaming_card=True,
+        cfg=SimpleNamespace(merge_segments=True),
+        inject=MagicMock(),
+    )
+    ctx = SimpleNamespace(
+        _run_still_current=lambda: True,
+        stream_consumer_holder=[consumer],
+        _live_status_adapter=None,
+        _live_status_mode="off",
+        log_queue=None,
+        progress_queue=None,
+    )
+    turn = TurnRunner(SimpleNamespace(), ctx)
+
+    turn.progress_callback(
+        "subagent.start",
+        subagent_id="child-1",
+        task_count=1,
+    )
+    turn.progress_callback("tool.started", "web_search", "Hermes v0.20")
+    turn._flush_cardkit_progress()
+
+    injected = [call.args[0] for call in consumer.inject.call_args_list]
+    assert injected == ["🔀 子任务启动", "🔧 web_search: Hermes v0.20"]
+
+
 def _push_all(aggregator, events):
     lines = []
     for event_type, tool_name, preview, metadata in events:
