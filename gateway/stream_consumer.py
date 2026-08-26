@@ -354,6 +354,7 @@ class GatewayStreamConsumer:
         self._streaming_card_stopped = False
         self._streaming_card_stop_status: Optional[str] = None
         self._cardkit_message_ids: set[str] = set()
+        self._cardkit_pending_stops: dict[str, str] = {}
         self._cardkit_overflowed = False
         self._cardkit_injected_lines: list[str] = []
 
@@ -1230,7 +1231,12 @@ class GatewayStreamConsumer:
                         self._accumulated = self._accumulated[split_at:].lstrip("\n")
                         if self._uses_streaming_card:
                             self._cardkit_overflowed = True
-                            await self._stop_streaming_card_if_active(status="continued")
+                            old_card_id = self._message_id
+                            stopped = await self._stop_streaming_card_if_active(
+                                status="continued"
+                            )
+                            if not stopped and old_card_id:
+                                self._cardkit_pending_stops[str(old_card_id)] = "continued"
                             self._streaming_card_stopped = False
                             self._streaming_card_stop_status = None
                         self._message_id = None
@@ -1466,6 +1472,7 @@ class GatewayStreamConsumer:
             logger.error("Stream consumer error: %s", e)
         finally:
             await self._stop_streaming_card_if_active(status="terminated")
+            await self._retry_pending_card_stops()
             # Safety net: if run() exits (normal return, cancellation, or
             # exception) while a _FLUSH barrier is still queued or was consumed
             # but not yet signaled, wake any waiters now. Without this a caller
@@ -1508,6 +1515,36 @@ class GatewayStreamConsumer:
         except Exception:
             logger.debug("CardKit stop failed", exc_info=True)
             return False
+
+    async def _retry_pending_card_stops(self) -> None:
+        """Retry overflow cards whose first continued stop was not acknowledged."""
+        for message_id, status in list(self._cardkit_pending_stops.items()):
+            try:
+                if await self.adapter.stop_streaming_card(message_id, status=status):
+                    self._cardkit_pending_stops.pop(message_id, None)
+            except Exception:
+                logger.debug("Pending CardKit stop retry failed", exc_info=True)
+
+    def cardkit_transformed_update_payload(self, final_text: str) -> Optional[str]:
+        """Return the safe payload for a post-stream CardKit transform.
+
+        A split CardKit's active message contains only the last tail. When the
+        transform prefix-extends the authoritative streamed answer, append only
+        the new suffix to that tail instead of repeating sealed head cards.
+        ``None`` means the transform rewrote earlier content and cannot be
+        reconciled safely in place.
+        """
+        if not self._uses_streaming_card or not self._cardkit_overflowed:
+            return final_text
+        ledger = self._clean_for_display(self._stream_ledger or "")
+        transformed = self._clean_for_display(final_text or "")
+        if ledger and transformed.startswith(ledger):
+            suffix = transformed[len(ledger):]
+            tail = self._clean_for_display(
+                self._last_sent_text or self._accumulated or ""
+            )
+            return tail + suffix
+        return None
 
     # Strip MEDIA:<path> tags before display. Uses the shared anchored
     # MEDIA_TAG_CLEANUP_RE from gateway/platforms/base.py — only tags whose

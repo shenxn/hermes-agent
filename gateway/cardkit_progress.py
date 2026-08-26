@@ -109,6 +109,16 @@ class CardKitProgressAggregator:
             lines.extend(self._drain_bucket(bucket, f"🔧 {name}", with_preview=True))
         return lines
 
+    def _reset_delegation_batch(self) -> None:
+        """Release identity state after one delegation batch is terminal."""
+        self._completed_children.clear()
+        for bucket in self._lifecycle.values():
+            bucket.count = 0
+            bucket.preview = None
+            bucket.task_count = 1
+            bucket.seen.clear()
+        self._subagent_tools.clear()
+
     def push(
         self,
         event_type: str,
@@ -203,6 +213,7 @@ class CardKitProgressAggregator:
                 lines = self._drain_lifecycle("start") + self._drain_lifecycle("thinking") + lines
                 lines.extend(self._drain_subagent_tools())
                 lines.extend(self._drain_lifecycle("complete"))
+                self._reset_delegation_batch()
             return True, lines
 
         return False, []

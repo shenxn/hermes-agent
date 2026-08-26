@@ -1,3 +1,5 @@
+import pytest
+
 from gateway.cardkit_progress import CardKitProgressAggregator
 
 
@@ -32,6 +34,88 @@ def test_turn_runner_routes_structured_progress_to_active_cardkit():
 
     injected = [call.args[0] for call in consumer.inject.call_args_list]
     assert injected == ["🔀 子任务启动", "🔧 web_search: Hermes v0.20"]
+
+
+def test_subagent_aggregation_resets_between_delegation_batches():
+    aggregator = CardKitProgressAggregator()
+
+    first = []
+    for child in ("a", "b"):
+        _, lines = aggregator.push(
+            "subagent.complete",
+            subagent_id=child,
+            task_count=2,
+            status="completed",
+        )
+        first.extend(lines)
+    assert first == ["✅ 子任务完成 ×2"]
+
+    _, early = aggregator.push(
+        "subagent.complete",
+        subagent_id="c",
+        task_count=2,
+        status="completed",
+    )
+    assert early == []
+    _, second = aggregator.push(
+        "subagent.complete",
+        subagent_id="d",
+        task_count=2,
+        status="completed",
+    )
+    assert second == ["✅ 子任务完成 ×2"]
+
+
+@pytest.mark.asyncio
+async def test_delayed_cardkit_claim_is_rechecked_at_progress_transport():
+    import queue
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock
+
+    from gateway.run import TurnRunner
+
+    current = [True]
+    consumer = SimpleNamespace(inject=MagicMock(side_effect=lambda _text: current.__setitem__(0, False)))
+
+    class Adapter:
+        name = "feishu"
+        MAX_MESSAGE_LENGTH = 4000
+        send = AsyncMock(side_effect=AssertionError("standalone progress must not send"))
+        send_typing = AsyncMock()
+
+        async def edit_message(self, *args, **kwargs):
+            raise AssertionError("standalone progress must not edit")
+
+    adapter = Adapter()
+    runner = SimpleNamespace(_adapter_for_source=lambda _source: adapter)
+    progress_queue = queue.Queue()
+    progress_queue.put("🔧 web_search: delayed claim")
+    ctx = SimpleNamespace(
+        progress_queue=progress_queue,
+        source=SimpleNamespace(chat_id="oc_chat"),
+        _native_slack_task_cards=False,
+        progress_grouping="grouped",
+        _progress_metadata=None,
+        _progress_reply_to=None,
+        _cleanup_progress=False,
+        _cleanup_msg_ids=[],
+        _run_still_current=lambda: current[0],
+        agent_holder=[None],
+        last_progress_msg=[None],
+        repeat_count=[0],
+    )
+    turn = TurnRunner(runner, ctx)
+    ownership_checks = [0]
+
+    def claim_after_dequeue():
+        ownership_checks[0] += 1
+        return None if ownership_checks[0] == 1 else consumer
+
+    turn._cardkit_consumer = claim_after_dequeue
+    await turn.send_progress_messages()
+
+    consumer.inject.assert_called_once_with("🔧 web_search: delayed claim")
+    adapter.send.assert_not_awaited()
 
 
 def _push_all(aggregator, events):

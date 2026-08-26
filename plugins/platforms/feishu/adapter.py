@@ -2125,6 +2125,35 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.error("[Feishu] Failed to edit message %s: %s", message_id, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Delete a bot-authored Feishu message for preview cleanup."""
+        if not self._client or not message_id:
+            return False
+        try:
+            from lark_oapi.api.im.v1 import DeleteMessageRequest
+
+            request = (
+                DeleteMessageRequest.builder()
+                .message_id(message_id)
+                .build()
+            )
+            response = await self._run_blocking(
+                self._client.im.v1.message.delete, request
+            )
+            if response.success():
+                self._streaming_cards.pop(str(message_id), None)
+                self._finalized_streaming_cards.pop(str(message_id), None)
+                return True
+            logger.debug(
+                "[Feishu] Delete message failed: %s %s",
+                response.code,
+                response.msg,
+            )
+            return False
+        except Exception:
+            logger.debug("[Feishu] Delete message failed", exc_info=True)
+            return False
+
     @property
     def streaming_cards_enabled(self) -> bool:
         """Whether the installed SDK and connected client can use CardKit."""

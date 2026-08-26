@@ -2680,6 +2680,7 @@ from gateway.platforms.base import (
     EphemeralReply,
     MessageEvent,
     MessageType,
+    SendResult,
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     build_auto_tts_output_path,
@@ -4903,6 +4904,9 @@ class TurnRunner:
                 _edit_accepts_metadata = False
 
         async def _edit_progress_message(message_id: str, content: str):
+            if self._cardkit_consumer() is not None:
+                self._inject_cardkit_lines([content])
+                return SendResult(success=True)
             kwargs = {
                 "chat_id": ctx.source.chat_id,
                 "message_id": message_id,
@@ -4941,6 +4945,9 @@ class TurnRunner:
                 ctx._cleanup_msg_ids.append(str(result.message_id))
 
         async def _send_progress_text(text: str):
+            if self._cardkit_consumer() is not None:
+                self._inject_cardkit_lines([text])
+                return SendResult(success=True)
             result = await adapter.send(
                 chat_id=ctx.source.chat_id,
                 content=text,
@@ -5110,12 +5117,7 @@ class TurnRunner:
                             _last_edit_ts = time.monotonic()
                         else:
                             can_edit = False
-                        _flood_result = await adapter.send(
-                            chat_id=ctx.source.chat_id,
-                            content=msg,
-                            reply_to=ctx._progress_reply_to,
-                            metadata=ctx._progress_metadata,
-                        )
+                        _flood_result = await _send_progress_text(msg)
                         if (
                             ctx._cleanup_progress
                             and getattr(_flood_result, "success", False)
@@ -5126,20 +5128,10 @@ class TurnRunner:
                     if can_edit:
                         # First tool: send all accumulated text as new message
                         full_text = "\n".join(progress_lines)
-                        result = await adapter.send(
-                            chat_id=ctx.source.chat_id,
-                            content=full_text,
-                            reply_to=ctx._progress_reply_to,
-                            metadata=ctx._progress_metadata,
-                        )
+                        result = await _send_progress_text(full_text)
                     else:
                         # Editing unsupported: send just this line
-                        result = await adapter.send(
-                            chat_id=ctx.source.chat_id,
-                            content=msg,
-                            reply_to=ctx._progress_reply_to,
-                            metadata=ctx._progress_metadata,
-                        )
+                        result = await _send_progress_text(msg)
                     if result.success and result.message_id:
                         progress_msg_id = result.message_id
                         if ctx._cleanup_progress:
@@ -5155,6 +5147,25 @@ class TurnRunner:
             except queue.Empty:
                 await asyncio.sleep(0.3)
             except asyncio.CancelledError:
+                # CardKit may have claimed the turn while cancellation was
+                # propagating. Drain directly into it and never emit a late
+                # standalone Feishu progress bubble.
+                if self._cardkit_consumer() is not None:
+                    while not ctx.progress_queue.empty():
+                        try:
+                            raw = ctx.progress_queue.get_nowait()
+                        except Exception:
+                            break
+                        if isinstance(raw, tuple) and raw:
+                            if raw[0] == "__dedup__" and len(raw) == 3:
+                                self._inject_cardkit_lines(
+                                    [f"{raw[1]} (×{raw[2] + 1})"]
+                                )
+                            elif raw[0] != "__reset__":
+                                self._inject_cardkit_lines([str(raw)])
+                        else:
+                            self._inject_cardkit_lines([raw])
+                    return
                 # Drain remaining queued messages
                 while not ctx.progress_queue.empty():
                     try:
@@ -29890,13 +29901,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _sc_msg_id = _sc.message_id
                 if _sc_msg_id:
                     try:
-                        _transform_res = await _sc.adapter.edit_message(
-                            chat_id=source.chat_id,
-                            message_id=_sc_msg_id,
-                            content=response["final_response"],
-                            finalize=True,
+                        _update_payload = response["final_response"]
+                        _payload_resolver = getattr(
+                            _sc, "cardkit_transformed_update_payload", None
                         )
-                        if getattr(_transform_res, "success", False):
+                        if callable(_payload_resolver):
+                            _update_payload = _payload_resolver(_update_payload)
+                        if _update_payload is None:
+                            # A non-prefix rewrite cannot be applied to only the
+                            # final card of a multi-card overflow. Remove the
+                            # previews best-effort, then let normal final delivery
+                            # send the authoritative response once.
+                            _cleanup_ok = True
+                            for _mid in getattr(_sc, "_cardkit_message_ids", set()):
+                                try:
+                                    if not await _sc.adapter.delete_message(
+                                        source.chat_id, _mid
+                                    ):
+                                        _cleanup_ok = False
+                                except Exception:
+                                    _cleanup_ok = False
+                            logger.warning(
+                                "CardKit overflow transform for session %s rewrote earlier content; preview cleanup=%s and normal final delivery will be used.",
+                                session_key or "?", _cleanup_ok,
+                            )
+                            _transform_res = None
+                        else:
+                            _transform_res = await _sc.adapter.edit_message(
+                                chat_id=source.chat_id,
+                                message_id=_sc_msg_id,
+                                content=_update_payload,
+                                finalize=True,
+                            )
+                        if _transform_res is not None and getattr(
+                            _transform_res, "success", False
+                        ):
                             response["already_sent"] = True
                             logger.info(
                                 "Edited streamed message %s for session %s to include plugin-transformed content.",

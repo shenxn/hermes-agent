@@ -234,6 +234,68 @@ async def test_cardkit_overflow_stops_old_card_as_continued():
 
 
 @pytest.mark.asyncio
+async def test_failed_overflow_stop_is_retried_for_original_card():
+    adapter = _cardkit_adapter()
+    adapter.MAX_MESSAGE_LENGTH = 700
+    adapter.send_streaming_card = AsyncMock(
+        side_effect=[
+            SimpleNamespace(success=True, message_id="om_card_1"),
+            SimpleNamespace(success=True, message_id="om_card_2"),
+        ]
+    )
+    attempts = {"om_card_1": 0}
+
+    async def stop_card(message_id, *, status):
+        if message_id == "om_card_1":
+            attempts[message_id] += 1
+            return attempts[message_id] > 1
+        return True
+
+    adapter.stop_streaming_card = AsyncMock(side_effect=stop_card)
+    consumer = GatewayStreamConsumer(adapter, "oc_chat", _cardkit_config())
+    assert await consumer._send_or_edit("开头内容") is True
+
+    consumer.on_delta("长" * 900)
+    consumer.finish()
+    await consumer.run()
+
+    calls = [
+        (call.args[0], call.kwargs["status"])
+        for call in adapter.stop_streaming_card.await_args_list
+    ]
+    assert calls.count(("om_card_1", "continued")) == 2
+    assert ("om_card_2", "completed") in calls
+    assert consumer._cardkit_pending_stops == {}
+
+
+def test_overflow_transform_appends_only_suffix_to_last_card():
+    consumer = GatewayStreamConsumer(
+        _cardkit_adapter(), "oc_chat", _cardkit_config()
+    )
+    consumer._cardkit_overflowed = True
+    consumer._stream_ledger = "sealed head + active tail"
+    consumer._last_sent_text = "active tail"
+
+    payload = consumer.cardkit_transformed_update_payload(
+        "sealed head + active tail\n\n[plugin footer]"
+    )
+
+    assert payload == "active tail\n\n[plugin footer]"
+    assert "sealed head" not in payload
+
+
+def test_overflow_transform_rewrite_requires_fresh_delivery():
+    consumer = GatewayStreamConsumer(
+        _cardkit_adapter(), "oc_chat", _cardkit_config()
+    )
+    consumer._cardkit_overflowed = True
+    consumer._stream_ledger = "original"
+    consumer._last_sent_text = "original tail"
+
+    assert consumer.cardkit_transformed_update_payload("rewritten") is None
+
+
+@pytest.mark.asyncio
 async def test_failed_completed_stop_retries_as_completed_in_finally():
     adapter = _cardkit_adapter()
     adapter.stop_streaming_card = AsyncMock(side_effect=[False, True])
@@ -357,6 +419,30 @@ async def test_stop_failure_retains_card_for_retry_and_final_edits_use_cardkit()
     assert card.last_sent_content == "transformed"
     assert adapter._run_blocking.await_count == 4
     adapter._client.im.v1.message.update.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_feishu_delete_message_cleans_cardkit_registries():
+    adapter = FeishuAdapter.__new__(FeishuAdapter)
+    delete_api = MagicMock()
+    adapter._client = SimpleNamespace(
+        im=SimpleNamespace(v1=SimpleNamespace(message=SimpleNamespace(delete=delete_api)))
+    )
+    card = _FeishuStreamingCard(
+        card_id="card_1",
+        element_id="streaming_md_1",
+        message_id="om_card",
+    )
+    adapter._streaming_cards = {"om_card": card}
+    adapter._finalized_streaming_cards = OrderedDict({"om_card": card})
+    adapter._run_blocking = AsyncMock(
+        return_value=SimpleNamespace(success=lambda: True)
+    )
+
+    assert await adapter.delete_message("oc_chat", "om_card") is True
+    assert "om_card" not in adapter._streaming_cards
+    assert "om_card" not in adapter._finalized_streaming_cards
+    adapter._run_blocking.assert_awaited_once()
 
 
 def test_title_generation_enabled_false_skips_worker():
