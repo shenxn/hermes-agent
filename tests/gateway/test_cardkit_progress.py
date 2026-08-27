@@ -68,6 +68,7 @@ def test_subagent_aggregation_resets_between_delegation_batches():
 
 @pytest.mark.asyncio
 async def test_delayed_cardkit_claim_is_rechecked_at_progress_transport():
+    import asyncio
     import queue
     from types import SimpleNamespace
     from unittest.mock import AsyncMock, MagicMock
@@ -75,11 +76,16 @@ async def test_delayed_cardkit_claim_is_rechecked_at_progress_transport():
     from gateway.run import TurnRunner
 
     current = [True]
-    consumer = SimpleNamespace(inject=MagicMock(side_effect=lambda _text: current.__setitem__(0, False)))
+    consumer = SimpleNamespace(
+        _uses_streaming_card=True,
+        cfg=SimpleNamespace(merge_segments=True),
+        inject=MagicMock(side_effect=lambda _text: current.__setitem__(0, False)),
+    )
 
     class Adapter:
         name = "feishu"
         MAX_MESSAGE_LENGTH = 4000
+        streaming_cards_enabled = True
         send = AsyncMock(side_effect=AssertionError("standalone progress must not send"))
         send_typing = AsyncMock()
 
@@ -87,11 +93,22 @@ async def test_delayed_cardkit_claim_is_rechecked_at_progress_transport():
             raise AssertionError("standalone progress must not edit")
 
     adapter = Adapter()
-    runner = SimpleNamespace(_adapter_for_source=lambda _source: adapter)
+    runner = SimpleNamespace(
+        _adapter_for_source=lambda _source: adapter,
+        config=SimpleNamespace(
+            streaming=SimpleNamespace(
+                enabled=True,
+                streaming_mode="cardkit",
+                merge_segments=True,
+            )
+        ),
+    )
     progress_queue = queue.Queue()
     progress_queue.put("🔧 web_search: delayed claim")
+    holder = [None]
     ctx = SimpleNamespace(
         progress_queue=progress_queue,
+        stream_consumer_holder=holder,
         source=SimpleNamespace(chat_id="oc_chat"),
         _native_slack_task_cards=False,
         progress_grouping="grouped",
@@ -105,14 +122,12 @@ async def test_delayed_cardkit_claim_is_rechecked_at_progress_transport():
         repeat_count=[0],
     )
     turn = TurnRunner(runner, ctx)
-    ownership_checks = [0]
 
-    def claim_after_dequeue():
-        ownership_checks[0] += 1
-        return None if ownership_checks[0] == 1 else consumer
+    async def claim_on_later_tick():
+        await asyncio.sleep(0.05)
+        holder[0] = consumer
 
-    turn._cardkit_consumer = claim_after_dequeue
-    await turn.send_progress_messages()
+    await asyncio.gather(turn.send_progress_messages(), claim_on_later_tick())
 
     consumer.inject.assert_called_once_with("🔧 web_search: delayed claim")
     adapter.send.assert_not_awaited()

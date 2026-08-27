@@ -4325,6 +4325,39 @@ class TurnRunner:
             return consumer
         return None
 
+    def _cardkit_expected(self) -> bool:
+        """Whether this turn is configured to hand progress to CardKit."""
+        try:
+            streaming = self._runner.config.streaming
+            if not (
+                bool(streaming.enabled)
+                and str(streaming.streaming_mode).lower() == "cardkit"
+                and bool(streaming.merge_segments)
+            ):
+                return False
+            adapter = self._runner._adapter_for_source(self._ctx.source)
+            return bool(getattr(adapter, "streaming_cards_enabled", False))
+        except Exception:
+            return False
+
+    async def _wait_for_cardkit_consumer(self, timeout: float = 3.0):
+        """Bridge the short worker-start race before the stream consumer exists."""
+        consumer = self._cardkit_consumer()
+        if consumer is not None or not self._cardkit_expected():
+            return consumer
+        deadline = asyncio.get_running_loop().time() + timeout
+        while self._ctx._run_still_current():
+            holder = self._ctx.stream_consumer_holder
+            if holder and holder[0] is not None:
+                return self._cardkit_consumer()
+            if asyncio.get_running_loop().time() >= deadline:
+                logger.warning(
+                    "Timed out waiting for CardKit consumer; falling back to standalone progress"
+                )
+                return None
+            await asyncio.sleep(0.02)
+        return None
+
     def _inject_cardkit_lines(self, lines) -> bool:
         consumer = self._cardkit_consumer()
         if consumer is None:
@@ -5013,10 +5046,11 @@ class TurnRunner:
 
                 raw = ctx.progress_queue.get_nowait()
 
-                # The consumer may come online after early progress was queued.
-                # Once CardKit owns the turn, drain those early legacy entries
-                # into the card instead of emitting a second progress bubble.
-                if self._cardkit_consumer() is not None:
+                # The stream worker may create the consumer a few event-loop
+                # ticks after progress becomes available. In CardKit mode wait
+                # for that ownership decision before sending a standalone bubble.
+                _cardkit_consumer = await self._wait_for_cardkit_consumer()
+                if _cardkit_consumer is not None:
                     if isinstance(raw, tuple) and raw:
                         if raw[0] == "__dedup__" and len(raw) == 3:
                             self._inject_cardkit_lines([f"{raw[1]} (×{raw[2] + 1})"])
