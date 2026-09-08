@@ -32,6 +32,58 @@ def test_planned_restart_notification_pending_roundtrip(tmp_path, monkeypatch):
     assert gateway_run._planned_restart_notification_pending() is False
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chat_restart", [False, True])
+async def test_planned_restart_startup_only_acknowledges_explicit_requester(
+    tmp_path, monkeypatch, chat_restart
+):
+    """Exercise start(), not just the sender: planned markers never broadcast."""
+    from tests.gateway.test_startup_restart_race import patch_startup_side_effects
+
+    patch_startup_side_effects(monkeypatch, tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    template, adapter = make_restart_runner()
+    template.config.sessions_dir = tmp_path / "sessions"
+    template.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
+        platform=Platform.TELEGRAM, chat_id="idle-home", name="Ops Home"
+    )
+    runner = gateway_run.GatewayRunner(template.config)
+    monkeypatch.setattr(runner, "_create_adapter", lambda *args: adapter)
+    monkeypatch.setattr(runner, "_start_secondary_profile_adapters", AsyncMock(return_value=0))
+    monkeypatch.setattr(runner, "_start_loop_liveness_guards", lambda *args: None)
+    monkeypatch.setattr(runner, "_start_loop_heartbeat_task", lambda: None)
+    monkeypatch.setattr(runner, "_spawn_supervised", MagicMock())
+    monkeypatch.setattr(runner, "_install_plugin_message_injector", lambda: None)
+    redeliver = AsyncMock()
+    resume = MagicMock(return_value=0)
+    monkeypatch.setattr(runner, "_redeliver_pending_obligations", redeliver)
+    monkeypatch.setattr(runner, "_schedule_resume_pending_sessions", resume)
+
+    planned = tmp_path / ".restart_pending.json"
+    planned.write_text("{}")
+    notify = tmp_path / ".restart_notify.json"
+    if chat_restart:
+        notify.write_text(json.dumps({
+            "platform": "telegram", "chat_id": "requester", "thread_id": "topic-7"
+        }))
+
+    assert await runner.start() is True
+
+    assert not planned.exists()
+    assert not notify.exists()
+    redeliver.assert_awaited_once()
+    resume.assert_called_once()
+    if chat_restart:
+        assert len(adapter.sent_calls) == 1
+        chat_id, content, metadata = adapter.sent_calls[0]
+        assert chat_id == "requester"
+        assert "restart" in content.lower()
+        assert metadata["thread_id"] == "topic-7"
+        assert runner._booted_from_restart is True
+    else:
+        assert adapter.sent_calls == []
+
+
 # ── _handle_restart_command writes .restart_notify.json ──────────────────
 
 

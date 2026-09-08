@@ -771,9 +771,10 @@ async def test_startup_restore_waits_for_resume_before_draining_inbound():
 
 
 @pytest.mark.asyncio
-async def test_restart_notifies_home_channel_even_without_active_sessions():
+@pytest.mark.parametrize("restart", [False, True])
+async def test_idle_shutdown_does_not_notify_home_channel(restart):
     runner, adapter = make_restart_runner()
-    runner._restart_requested = True
+    runner._restart_requested = restart
     runner.config.platforms[Platform.TELEGRAM].home_channel = HomeChannel(
         platform=Platform.TELEGRAM,
         chat_id="home-42",
@@ -782,14 +783,11 @@ async def test_restart_notifies_home_channel_even_without_active_sessions():
 
     await runner._notify_active_sessions_of_shutdown()
 
-    assert adapter.sent == [
-        "⚠️ Gateway restarting — Your current task will be interrupted. "
-        "Send any message after restart and I'll try to resume where you left off."
-    ]
+    assert adapter.sent_calls == []
 
 
 @pytest.mark.asyncio
-async def test_restart_home_channel_notification_not_deduped_across_threads():
+async def test_restart_notifies_only_interrupted_topic_not_idle_home():
     runner, adapter = make_restart_runner()
     runner._restart_requested = True
     session_key = "agent:main:telegram:group:999"
@@ -811,9 +809,14 @@ async def test_restart_home_channel_notification_not_deduped_across_threads():
 
     await runner._notify_active_sessions_of_shutdown()
 
-    assert len(adapter.sent) == 2
-    assert adapter.sent_calls[0][2] == {"thread_id": "topic-7"}
-    assert adapter.sent_calls[1][2] is None
+    assert adapter.sent_calls == [
+        (
+            "999",
+            "⚠️ Gateway restarting — Your current task will be interrupted. "
+            "Send any message after restart and I'll try to resume where you left off.",
+            {"thread_id": "topic-7"},
+        )
+    ]
 
 
 # ---------------------------------------------------------------------------

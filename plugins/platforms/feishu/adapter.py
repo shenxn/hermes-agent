@@ -3669,6 +3669,61 @@ class FeishuAdapter(BasePlatformAdapter):
         _extra = getattr(_config, "extra", None) or {}
         return resolve_channel_prompt(_extra, chat_id, parent_id)
 
+    async def send_clarify(
+        self, chat_id, question, choices, clarify_id, session_key, metadata=None,
+    ) -> SendResult:
+        result = await super().send_clarify(
+            chat_id, question, choices, clarify_id, session_key, metadata,
+        )
+        if result.success and result.message_id:
+            # Only prompt replies are aliases, never arbitrary roots/topics.
+            routes = getattr(self, "_clarify_reply_routes", None)
+            if routes is None:
+                routes = self._clarify_reply_routes = OrderedDict()
+            routes[result.message_id] = (
+                clarify_id, session_key, chat_id, (metadata or {}).get("thread_id"),
+            )
+            while len(routes) > 256:
+                routes.popitem(last=False)
+        return result
+
+    def _clarify_reply_route(self, message, sender_id):
+        from gateway.session import build_session_key
+        from tools import clarify_gateway as cm
+
+        routes = getattr(self, "_clarify_reply_routes", {})
+        reply_id = (getattr(message, "parent_id", None)
+                    or getattr(message, "upper_message_id", None)
+                    or getattr(message, "root_id", None))
+        route = routes.get(reply_id)
+        if route is None:
+            return None
+        clarify_id, session_key, chat_id, thread_id = route
+        entry = cm.get_pending_for_session(session_key, include_choice_prompts=True)
+        if entry is None or entry.clarify_id != clarify_id or entry.event.is_set():
+            routes.pop(reply_id, None)
+            return None
+        if getattr(message, "chat_id", None) != chat_id:
+            return None
+
+        # A real, explicitly selected topic must not become a main-chat reply.
+        if getattr(message, "thread_id", None) not in (None, "", thread_id):
+            return None
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_type="dm" if getattr(message, "chat_type", "group") == "p2p" else "group",
+            user_id=getattr(sender_id, "user_id", None) or getattr(sender_id, "open_id", None),
+            user_id_alt=getattr(sender_id, "union_id", None),
+            thread_id=thread_id,
+        )
+        key = build_session_key(
+            source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            profile=self._session_key_profile(source),
+        )
+        return route if key == session_key else None
+
     async def _process_inbound_message(
         self,
         *,
@@ -3726,6 +3781,10 @@ class FeishuAdapter(BasePlatformAdapter):
         chat_id = getattr(message, "chat_id", "") or ""
         chat_info = await self.get_chat_info(chat_id)
         sender_profile = await self._resolve_sender_profile(sender_id, is_bot=is_bot)
+        # Recheck after I/O: an expired/resolved prompt no longer owns replies.
+        clarify_route = self._clarify_reply_route(message, sender_id)
+        if clarify_route is not None:
+            thread_id = clarify_route[3]
         source = self.build_source(
             chat_id=chat_id,
             chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
